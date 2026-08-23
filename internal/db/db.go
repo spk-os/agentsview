@@ -499,7 +499,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     content,
     content='messages',
     content_rowid='id',
-    tokenize='porter unicode61'
+    tokenize='trigram'
 );
 
 CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
@@ -4302,6 +4302,35 @@ func (db *DB) init(ctx context.Context) error {
 		return fmt.Errorf("checking fts table: %w", err)
 	}
 	hadFTS := ftsCount > 0
+
+	// SPK customization: migrate the legacy porter/unicode61 tokenizer
+	// to trigram so multi-rune CJK phrases match. CREATE VIRTUAL TABLE
+	// IF NOT EXISTS will not replace an existing table, so when the
+	// current table still uses the old tokenizer, drop it once and let
+	// the schema init below recreate+backfill with trigram. Idempotent:
+	// once the table's SQL contains "trigram" this is a no-op.
+	if hadFTS {
+		var ftsSQL string
+		if err := w.QueryRowContext(ctx,
+			"SELECT sql FROM sqlite_master"+
+				" WHERE type='table' AND name='messages_fts'",
+		).Scan(&ftsSQL); err != nil {
+			return fmt.Errorf("checking fts tokenizer: %w", err)
+		}
+		if !strings.Contains(ftsSQL, "trigram") {
+			for _, s := range []string{
+				"DROP TRIGGER IF EXISTS messages_ai",
+				"DROP TRIGGER IF EXISTS messages_ad",
+				"DROP TRIGGER IF EXISTS messages_au",
+				"DROP TABLE IF EXISTS messages_fts",
+			} {
+				if _, err := w.ExecContext(ctx, s); err != nil {
+					return fmt.Errorf("drop legacy fts (%s): %w", s, err)
+				}
+			}
+			hadFTS = false
+		}
+	}
 
 	// Attempt to initialize FTS. Failure is non-fatal
 	// (might be missing module).

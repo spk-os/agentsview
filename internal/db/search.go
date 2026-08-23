@@ -389,6 +389,15 @@ func (db *DB) Search(
 	}
 	likePattern := "%" + escapeLike(plainQuery) + "%"
 
+	// SPK customization: the trigram tokenizer needs >=3 runes to form a
+	// 3-gram, so short CJK phrases (e.g. "根因") and queries carrying FTS
+	// metacharacters match nothing via FTS. Fall back to a plain content
+	// LIKE scan so every matching session — including all user-role
+	// messages — stays reachable. (See searchSessionsByContentLike.)
+	if !ftsFriendlyQuery(plainQuery) {
+		return db.searchSessionsByContentLike(ctx, f, plainQuery, likePattern, orderBy)
+	}
+
 	// Build args in the order the SQL placeholders appear.
 	// Position 0 (? AS best_query in the ROW_NUMBER SELECT) is
 	// prepended after this block — see args2 below.
@@ -530,6 +539,108 @@ func (db *DB) Search(
 		); err != nil {
 			return SearchPage{},
 				fmt.Errorf("scanning result: %w", err)
+		}
+		results = append(results, r)
+	}
+	if err := rows.Err(); err != nil {
+		return SearchPage{}, err
+	}
+
+	page := SearchPage{Results: results}
+	if len(results) > f.Limit {
+		page.Results = results[:f.Limit]
+		page.NextCursor = f.Cursor + f.Limit
+	}
+	return page, nil
+}
+
+// ftsFriendlyQuery reports whether a query can be answered by the
+// trigram FTS index. The trigram tokenizer needs >=3 runes to form a
+// 3-gram; shorter CJK phrases (e.g. "根因", "搜索") and queries
+// carrying FTS metacharacters would otherwise return zero rows.
+func ftsFriendlyQuery(q string) bool {
+	if len([]rune(q)) < 3 {
+		return false
+	}
+	for _, r := range q {
+		switch r {
+		case '"', '-', '*', '(', ')', '.', ':', '\\':
+			return false
+		}
+	}
+	return true
+}
+
+// searchSessionsByContentLike is the LIKE fallback for FTS-unfriendly
+// queries (short CJK phrases, FTS metacharacters). It scans messages
+// directly, taking each session's earliest matching message as the
+// representative row so the result shape matches the FTS path. The
+// snippet is a plain-text window around the first match (no <mark>
+// highlighting), which is acceptable since the goal is reachability
+// of sessions containing the query — including all user-role messages.
+func (db *DB) searchSessionsByContentLike(
+	ctx context.Context, f SearchFilter,
+	plainQuery, likePattern, orderBy string,
+) (SearchPage, error) {
+	where := []string{
+		"m.content LIKE ? ESCAPE '\\'",
+		"s.deleted_at IS NULL",
+		"m.is_system = 0",
+		SystemPrefixSQL("m.content", "m.role"),
+	}
+	var projectArgs []any
+	if f.Project != "" {
+		where = append(where, "s.project = ?")
+		projectArgs = []any{f.Project}
+	}
+	whereSQL := strings.Join(where, " AND ")
+
+	query := fmt.Sprintf(`
+		SELECT session_id, project, agent, name,
+			session_ended_at, ordinal, snippet, rank, match_pos
+		FROM (
+			SELECT m.session_id, s.project, s.agent,
+				COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
+				COALESCE(s.ended_at, s.started_at, '') AS session_ended_at,
+				m.ordinal AS ordinal,
+				substr(m.content,
+					max(1, instr(LOWER(m.content), LOWER(?)) - 20), 80) AS snippet,
+				0.0 AS rank,
+				instr(LOWER(m.content), LOWER(?)) AS match_pos,
+				ROW_NUMBER() OVER (
+					PARTITION BY m.session_id
+					ORDER BY m.ordinal ASC
+				) AS rn
+			FROM messages m
+			JOIN sessions s ON m.session_id = s.id
+			WHERE %s
+		)
+		WHERE rn = 1
+		ORDER BY %s
+		LIMIT ? OFFSET ?`,
+		whereSQL, orderBy,
+	)
+
+	args := []any{plainQuery, plainQuery, likePattern}
+	args = append(args, projectArgs...)
+	args = append(args, f.Limit+1, f.Cursor)
+
+	rows, err := db.getReader().QueryContext(ctx, query, args...)
+	if err != nil {
+		return SearchPage{}, fmt.Errorf("searching (like fallback): %w", err)
+	}
+	defer rows.Close()
+
+	results := make([]SearchResult, 0, f.Limit)
+	for rows.Next() {
+		var r SearchResult
+		var matchPos int
+		if err := rows.Scan(
+			&r.SessionID, &r.Project, &r.Agent, &r.Name,
+			&r.SessionEndedAt, &r.Ordinal,
+			&r.Snippet, &r.Rank, &matchPos,
+		); err != nil {
+			return SearchPage{}, fmt.Errorf("scanning result (like fallback): %w", err)
 		}
 		results = append(results, r)
 	}

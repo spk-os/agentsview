@@ -633,6 +633,13 @@ func (db *DB) searchContentFTS(
 	if !db.HasFTS() {
 		return ContentSearchPage{}, errFTSUnavailable
 	}
+	// SPK customization: short CJK phrases (<3 runes) and queries
+	// carrying FTS metacharacters cannot be expressed as trigrams, so
+	// trigram MATCH would return nothing for them. Fall back to the
+	// substring (LIKE) path, which is CJK-friendly.
+	if !ftsFriendlyQuery(f.Pattern) {
+		return db.searchContentSubstring(ctx, f)
+	}
 	scope, scopeArgs := sessionScopeSubquery(f)
 	sysPred := "1=1"
 	if f.ExcludeSystem {
