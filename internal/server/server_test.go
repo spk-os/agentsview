@@ -1532,6 +1532,35 @@ func TestListSessions_WithData(t *testing.T) {
 	}
 }
 
+func TestListSessions_IncludesSourcePathOnlyWhenRequested(t *testing.T) {
+	te := setup(t)
+	sourcePath := filepath.Join(t.TempDir(), "session.jsonl")
+	te.seedSession(t, "s1", "my-app", 5, func(s *db.Session) {
+		s.FilePath = &sourcePath
+	})
+
+	decodeSession := func(t *testing.T, path string) map[string]jsontext.Value {
+		t.Helper()
+		w := te.get(t, path)
+		assertStatus(t, w, http.StatusOK)
+		var raw struct {
+			Sessions []map[string]jsontext.Value `json:"sessions"`
+		}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &raw))
+		require.Len(t, raw.Sessions, 1)
+		return raw.Sessions[0]
+	}
+
+	withoutSource := decodeSession(t, "/api/v1/sessions")
+	assert.NotContains(t, withoutSource, "file_path")
+
+	withSource := decodeSession(t, "/api/v1/sessions?include_source=true")
+	require.Contains(t, withSource, "file_path")
+	var gotPath string
+	require.NoError(t, json.Unmarshal(withSource["file_path"], &gotPath))
+	assert.Equal(t, sourcePath, gotPath)
+}
+
 func TestListSessions_ProjectFilter(t *testing.T) {
 	te := setup(t)
 	te.seedSession(t, "s1", "my-app", 5)
@@ -3657,9 +3686,10 @@ func TestSettingsDisabledProvidersRoundTrip(t *testing.T) {
 	w := put(`{"disabled_agents":["gemini","claude","gemini"]}`)
 	assertStatus(t, w, http.StatusOK)
 	type sessionProvider struct {
-		ID          parser.AgentType `json:"id"`
-		DisplayName string           `json:"display_name"`
-		Dirs        []string         `json:"dirs"`
+		ID                 parser.AgentType `json:"id"`
+		DisplayName        string           `json:"display_name"`
+		Dirs               []string         `json:"dirs"`
+		PostAnswerToolWork bool             `json:"post_answer_tool_work"`
 	}
 	var got struct {
 		SessionProviders []sessionProvider  `json:"session_providers"`
@@ -3674,6 +3704,13 @@ func TestSettingsDisabledProvidersRoundTrip(t *testing.T) {
 	assert.Equal(t, parser.AgentClaude, got.SessionProviders[0].ID)
 	assert.Equal(t, "Claude Code", got.SessionProviders[0].DisplayName)
 	assert.Equal(t, []string{"/sessions/claude"}, got.SessionProviders[0].Dirs)
+	assert.False(t, got.SessionProviders[0].PostAnswerToolWork)
+	codexIndex := slices.IndexFunc(got.SessionProviders,
+		func(provider sessionProvider) bool {
+			return provider.ID == parser.AgentCodex
+		})
+	require.NotEqual(t, -1, codexIndex)
+	assert.True(t, got.SessionProviders[codexIndex].PostAnswerToolWork)
 	geminiIndex := slices.IndexFunc(got.SessionProviders,
 		func(provider sessionProvider) bool {
 			return provider.ID == parser.AgentGemini
@@ -5375,4 +5412,60 @@ func TestHandleSyncSession_InvalidJSON(t *testing.T) {
 	w := httptest.NewRecorder()
 	te.handler.ServeHTTP(w, req)
 	assertStatus(t, w, http.StatusBadRequest)
+}
+
+func TestSettingsAgentHomesPersistAndRoundTrip(t *testing.T) {
+	te := setup(t)
+	put := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/settings",
+			strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		te.handler.ServeHTTP(w, req)
+		return w
+	}
+	type sessionProvider struct {
+		ID             parser.AgentType `json:"id"`
+		HomesSupported bool             `json:"homes_supported"`
+		Homes          []string         `json:"homes"`
+	}
+	decode := func(w *httptest.ResponseRecorder) map[parser.AgentType]sessionProvider {
+		var got struct {
+			SessionProviders []sessionProvider `json:"session_providers"`
+		}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+		byID := make(map[parser.AgentType]sessionProvider, len(got.SessionProviders))
+		for _, provider := range got.SessionProviders {
+			byID[provider.ID] = provider
+		}
+		return byID
+	}
+
+	w := put(`{"agent_homes":{"codex":["~/.codex-work","/srv/codex"]}}`)
+	assertStatus(t, w, http.StatusOK)
+	providers := decode(w)
+	assert.True(t, providers[parser.AgentCodex].HomesSupported)
+	assert.Equal(t, []string{"~/.codex-work", "/srv/codex"},
+		providers[parser.AgentCodex].Homes)
+	assert.True(t, providers[parser.AgentClaude].HomesSupported)
+	assert.Equal(t, []string{}, providers[parser.AgentClaude].Homes)
+	assert.False(t, providers[parser.AgentGemini].HomesSupported)
+
+	var persisted struct {
+		CodexHomes []string `toml:"codex_homes"`
+	}
+	_, err := toml.DecodeFile(filepath.Join(te.dataDir, "config.toml"), &persisted)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"~/.codex-work", "/srv/codex"}, persisted.CodexHomes)
+
+	w = put(`{"agent_homes":{"gemini":["/x"]}}`)
+	assertStatus(t, w, http.StatusBadRequest)
+	assertBodyContains(t, w, "does not support alternate homes")
+
+	w = put(`{"agent_homes":{"codex":[]}}`)
+	assertStatus(t, w, http.StatusOK)
+	assert.Equal(t, []string{}, decode(w)[parser.AgentCodex].Homes)
+	raw, err := os.ReadFile(filepath.Join(te.dataDir, "config.toml"))
+	require.NoError(t, err)
+	assert.NotContains(t, string(raw), "codex_homes")
 }

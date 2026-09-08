@@ -1669,8 +1669,13 @@ func (p *codexProvider) codexParentResolution(
 	if parentID == "" || !resolutionNeeded {
 		return "", false
 	}
-	turnIDs, resolved := p.parentTurnResolver(ctx, childPath)(parentID)
-	return parentID, resolved && len(turnIDs) > 0
+	// A parent that was read is settled even when it holds no turn ids.
+	// Codex writes a rollout the moment a thread opens, so a fork taken
+	// before the first prompt names a parent with only session_meta and
+	// settings events; the fork replayed nothing and a retry could never
+	// learn more. Only a parent that cannot be read defers the child.
+	_, resolved := p.parentTurnResolver(ctx, childPath)(parentID)
+	return parentID, resolved
 }
 
 // CodexReplayParentID returns the explicit parent only when the rollout has a
@@ -1823,15 +1828,13 @@ func (p *codexProvider) parseSessionSnapshotContext(
 	mtime := info.ModTime().UnixNano()
 	if p.spec.agent == AgentCodex {
 		// Include session_index.jsonl mtime so Codex renames trigger a re-parse.
-		mtime = CodexEffectiveMtime(path, mtime)
+		mtime = p.sources.metadata.EffectiveMtime(path, mtime)
 	}
 
 	sessionName := ""
 	sessionNamePresent := false
 	if p.spec.agent == AgentCodex {
-		sessionName, sessionNamePresent = LookupCodexThreadNameEntry(
-			path, b.sessionID,
-		)
+		sessionName, sessionNamePresent, _ = p.sources.metadata.ReadThreadName(path, b.sessionID)
 	}
 	if !sessionNamePresent && sessionName == "" && b.firstMessage == "" &&
 		b.relationshipType == RelSubagent {
@@ -1909,7 +1912,7 @@ func EvictAllCodexSessionIndexes() {
 // one Codex transcript. Explicit full-parse callers use this when an external
 // event says the sidecar changed even if its stat tuple did not.
 func EvictCodexSessionIndexForSession(sessionPath string) {
-	if indexPath := codexSessionIndexPath(sessionPath); indexPath != "" {
+	for _, indexPath := range (CodexMetadata{}).IndexPaths(sessionPath) {
 		EvictCodexSessionIndex(indexPath)
 	}
 }
@@ -1938,54 +1941,20 @@ func LookupCodexThreadNameEntry(
 // A missing index is a verified absence and returns no error; modern Codex
 // releases no longer create this file. Callers that persist freshness state
 // use the error to distinguish that normal absence from a transient failure.
-func ReadCodexThreadNameEntry(
-	sessionPath, sessionID string,
-) (string, bool, error) {
-	if strings.TrimSpace(sessionID) == "" {
-		return "", false, nil
-	}
-	indexPath := codexSessionIndexPath(sessionPath)
-	if indexPath == "" {
-		return "", false, nil
-	}
-	titles, err := loadCodexSessionIndex(indexPath)
-	if errors.Is(err, os.ErrNotExist) {
-		return "", false, nil
-	}
-	if err != nil {
-		return "", false, err
-	}
-	title, ok := titles[sessionID]
-	return strings.TrimSpace(title), ok, nil
+func ReadCodexThreadNameEntry(sessionPath, sessionID string) (string, bool, error) {
+	return (CodexMetadata{}).ReadThreadName(sessionPath, sessionID)
 }
 
 // VerifyCodexSessionIndex reports whether the title index associated with a
 // rollout was read successfully or confirmed absent. It preserves non-ENOENT
 // failures so callers cannot persist a freshness digest for unchecked title
 // metadata.
-func VerifyCodexSessionIndex(sessionPath string) error {
-	indexPath := codexSessionIndexPath(sessionPath)
-	if indexPath == "" {
-		return nil
-	}
-	_, err := loadCodexSessionIndex(indexPath)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	return err
-}
+func VerifyCodexSessionIndex(sessionPath string) error { return (CodexMetadata{}).Verify(sessionPath) }
 
 // CodexEffectiveMtime returns the effective mtime for a Codex session file,
 // incorporating session_index.jsonl so renames invalidate the cache.
 func CodexEffectiveMtime(sessionPath string, fileMtime int64) int64 {
-	if idxPath := codexSessionIndexPath(sessionPath); idxPath != "" {
-		if si, err := os.Stat(idxPath); err == nil {
-			if idxMtime := si.ModTime().UnixNano(); idxMtime > fileMtime {
-				return idxMtime
-			}
-		}
-	}
-	return fileMtime
+	return (CodexMetadata{}).EffectiveMtime(sessionPath, fileMtime)
 }
 
 // CodexSessionIndexPath returns the local session_index.jsonl path associated

@@ -425,7 +425,44 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // (90: Grok message timestamp backfill. Grok chat-history rows do not carry
 // timestamps; re-parsing enriches them from the authoritative timestamped
 // updates stream so existing sessions participate in activity aggregation.)
-const dataVersion = 90
+// (91: Posit Assistant inferred cache-write normalization. Existing
+// non-Anthropic auto-cached model rows need re-parsing so their persisted
+// uncached prompt remainder is priced as input rather than cache creation.)
+// (92: Antigravity CLI workspace project normalization. Existing rows store
+// the raw workspace path from history.jsonl as the project; re-parsing routes
+// it through the shared cwd normalizer so sessions from different git
+// worktrees of the same repo group under one project.)
+// (93: Posit Assistant usage-events sidecar ingestion. Existing sessions
+// need re-parsing so keepalive and classifier spend recorded in
+// usage-events.jsonl reaches the usage_events table.)
+// (94: Devin message_nodes token usage. The Devin parser now reads the
+// per-assistant-message metrics recorded at chat_message ->
+// metadata.metrics in message_nodes, summed along the session main chain,
+// so token usage and cost surface for the ~80% of sessions that have no
+// exported transcript. Existing message-node-fallback rows carried no token
+// usage and need re-parsing; a fingerprint change alone cannot cover this,
+// because those sessions hash only raw epoch integers and content that are
+// byte-identical before and after the fix, so incremental sync would skip
+// the correction.)
+// (95: Posit Assistant provider identity. Existing messages and usage events
+// need re-parsing so managed Posit AI and BYO provider rows price separately.)
+// (96: Antigravity CLI sessions recover CWD from history and the exact
+// cache/last_conversations.json workspace mapping. Existing rows need
+// re-parsing to receive the exact approved workspace and prefer linked Git
+// identity when normalizing worktree project labels.)
+// (97: Tool-result summaries a single result event already stores are no
+// longer written to tool_calls.result_content; result_content_length still
+// records the summary size and readers re-derive the text from the event.
+// Existing rows need re-parsing to drop the duplicate copy, which was about
+// 40% of a large archive.)
+// (98: The Pi parser now attributes skill loads (SKILL.md
+// reads and skill:// URIs) so Pi tool calls count toward Top Skills.
+// Existing Pi rows need re-parsing to backfill the skill attribution.)
+// (99: the Antigravity CLI parser normalizes observed experimental serving
+// variant suffixes (-exp-b) against the matching effort-qualified executor
+// model. Existing Antigravity rows need re-parsing so stored messages and
+// usage events reflect the intended effort-qualified model.)
+const dataVersion = 99
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 
@@ -624,6 +661,7 @@ type DB struct {
 	// only then, so CLI resyncs never trigger an unrequested archive scan.
 	usageBackfillEnabled bool
 	mu                   sync.Mutex // serializes writes
+	compactMu            sync.Mutex // serializes staged archive compactions
 	connMu               sync.RWMutex
 	retired              []*sql.DB // old pools kept open for in-flight reads
 	// undrainedPools holds closed pools whose connections had not drained
@@ -638,6 +676,12 @@ type DB struct {
 	// ErrWriterClosed instead of the generic read-only error.
 	writerClosed atomic.Bool
 	dataStale    atomic.Bool // set by Open when user_version < dataVersion
+	// extractAllowCandidateFindings narrows the recall-extraction secret
+	// gate to definite-confidence findings. Set by the extraction manager
+	// from [recall.extract] candidate_findings; false (every recorded
+	// finding blocks) until then, so read-only tools and archives without
+	// extraction keep the strict boundary.
+	extractAllowCandidateFindings atomic.Bool
 
 	cursorMu     sync.RWMutex
 	cursorSecret []byte
@@ -746,11 +790,15 @@ func (w *writerHandle) current() (*sql.DB, error) {
 	if w.owner.readOnly {
 		return nil, ErrReadOnly
 	}
+	// The barrier check must also cover a non-nil pool: staged compaction
+	// reopens the pools on the installed-but-uncommitted archive with the
+	// barrier still up, and a write landing there would be lost by a
+	// rollback. Raw writer paths that do not take db.mu rely on this gate.
+	if w.owner.writerClosed.Load() {
+		return nil, ErrWriterClosed
+	}
 	db := w.owner.writer.Load()
 	if db == nil {
-		if w.owner.writerClosed.Load() {
-			return nil, ErrWriterClosed
-		}
 		return nil, ErrReadOnly
 	}
 	return db, nil
@@ -1579,6 +1627,7 @@ var readOnlyRequiredTables = []string{
 	"pg_sync_state",
 	"model_pricing",
 	"model_pricing_bands",
+	"genai_pricing",
 	"secret_findings",
 	"recall_entries",
 	"recall_evidence",
@@ -1907,6 +1956,14 @@ func legacySchemaColumnMigrations() []schemaColumnMigration {
 func schemaColumnMigrations() []schemaColumnMigration {
 	return []schemaColumnMigration{
 		{
+			"model_pricing", "cache_creation_1h_microdollars_per_mtok",
+			"ALTER TABLE model_pricing ADD COLUMN cache_creation_1h_microdollars_per_mtok INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"model_pricing_bands", "cache_creation_1h_microdollars_per_mtok",
+			"ALTER TABLE model_pricing_bands ADD COLUMN cache_creation_1h_microdollars_per_mtok INTEGER NOT NULL DEFAULT 0",
+		},
+		{
 			"artifact_import_queue", "quarantine_pending",
 			"ALTER TABLE artifact_import_queue ADD COLUMN quarantine_pending INTEGER NOT NULL DEFAULT 0",
 		},
@@ -2049,6 +2106,15 @@ func schemaColumnMigrations() []schemaColumnMigration {
 		{
 			"sessions", "local_modified_at",
 			"ALTER TABLE sessions ADD COLUMN local_modified_at TEXT",
+		},
+		{
+			"sessions", "source_missing_at",
+			"ALTER TABLE sessions ADD COLUMN source_missing_at TEXT;" +
+				" UPDATE sessions" +
+				" SET source_missing_at = deleted_at," +
+				" deleted_at = NULL, deletion_cause = NULL," +
+				" local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')" +
+				" WHERE deletion_cause = 'source_missing'",
 		},
 		{
 			"sessions", "transcript_revision",
@@ -2235,6 +2301,10 @@ func schemaColumnMigrations() []schemaColumnMigration {
 		{
 			"messages", "thinking_text",
 			"ALTER TABLE messages ADD COLUMN thinking_text TEXT NOT NULL DEFAULT ''",
+		},
+		{
+			"messages", "provider_id",
+			"ALTER TABLE messages ADD COLUMN provider_id TEXT NOT NULL DEFAULT ''",
 		},
 		{
 			"sessions", "termination_status",
@@ -2624,6 +2694,9 @@ func (db *DB) migrateColumns(ctx context.Context) error {
 	if _, err := w.ExecContext(ctx, modelPricingBandsSchemaSQL); err != nil {
 		return fmt.Errorf("creating model pricing bands: %w", err)
 	}
+	if _, err := w.ExecContext(ctx, genAIPricingSchemaSQL); err != nil {
+		return fmt.Errorf("creating GenAI pricing storage: %w", err)
+	}
 	if _, err := w.ExecContext(ctx, artifactSessionQueueTriggerDropsSQL); err != nil {
 		return fmt.Errorf("dropping artifact session queue triggers: %w", err)
 	}
@@ -2854,10 +2927,22 @@ CREATE TABLE IF NOT EXISTS model_pricing_bands (
     input_microdollars_per_mtok INTEGER NOT NULL,
     output_microdollars_per_mtok INTEGER NOT NULL,
     cache_creation_microdollars_per_mtok INTEGER NOT NULL,
+    cache_creation_1h_microdollars_per_mtok INTEGER NOT NULL DEFAULT 0,
     cache_read_microdollars_per_mtok INTEGER NOT NULL,
     updated_at TEXT NOT NULL
         DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     PRIMARY KEY (model_pattern, above_input_tokens)
+);`
+
+const genAIPricingSchemaSQL = `
+CREATE TABLE IF NOT EXISTS genai_pricing (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    version TEXT NOT NULL,
+    source_ref TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL CHECK (source IN ('embedded', 'fetched')),
+    data_json BLOB NOT NULL,
+    updated_at TEXT NOT NULL
+        DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );`
 
 const (
@@ -3310,7 +3395,7 @@ func (db *DB) createPartialIndexesLocked(w *writerHandle) error {
 
 var usageSessionCoveringIndexColumns = []string{
 	"session_id", "ordinal", "timestamp", "role", "model",
-	"claude_message_id", "claude_request_id", "token_usage", "source_uuid",
+	"provider_id", "claude_message_id", "claude_request_id", "token_usage", "source_uuid",
 }
 
 func ensureUsageIndexesLocked(w *writerHandle) error {
@@ -3339,7 +3424,7 @@ func ensureUsageIndexesLocked(w *writerHandle) error {
 	if err := ensureUsageIndexColumnsLocked(
 		w, "idx_messages_usage_session_covering", usageSessionCoveringIndexColumns,
 		`CREATE INDEX IF NOT EXISTS idx_messages_usage_session_covering
-		 ON messages(session_id, ordinal, timestamp, role, model,
+		 ON messages(session_id, ordinal, timestamp, role, model, provider_id,
 		             claude_message_id, claude_request_id, token_usage, source_uuid)
 		 WHERE token_usage != '' AND model != '' AND model != '<synthetic>'`,
 	); err != nil {
@@ -4541,11 +4626,16 @@ func (db *DB) CloseConnections() error {
 	}
 	db.StopUsageCacheBackfill()
 	db.stopWALCheckpointLoop()
-	// db.mu stays held through the drain: a concurrent Reopen or
-	// ReopenWriter would open fresh handles on the same path, letting this
-	// method return "drained" while new handles still block the rename.
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	return db.closeConnectionsLocked()
+}
+
+// closeConnectionsLocked closes both connection pools without acquiring
+// db.mu. The caller must hold db.mu for the whole close-and-drain interval.
+// Keeping that lock held is important for staged database replacement: no
+// writer can reopen a fresh pool between the close and the file swap.
+func (db *DB) closeConnectionsLocked() error {
 	db.connMu.Lock()
 
 	// Close the writer last: SQLite checkpoints and removes the WAL when
@@ -4693,22 +4783,21 @@ func (db *DB) Reopen() error {
 	if err := db.usageCache.RetireExcept(databaseID); err != nil {
 		return fmt.Errorf("retiring old usage cache generation: %w", err)
 	}
-	// Restart backfill only when this process explicitly enabled it
-	// (daemon lifecycle). A CLI resync reopening the archive must not
-	// kick off a full background scan of the replacement.
-	db.usageBackfillMu.Lock()
-	enabled := db.usageBackfillEnabled
-	db.usageBackfillMu.Unlock()
-	if !enabled {
-		return nil
-	}
-	return db.StartUsageCacheBackfill(context.Background())
+	return db.restartUsageCacheBackfillIfEnabled()
 }
 
 // reopenLocked performs the reopen while db.mu is already
 // held. New connections are opened before closing old ones
 // so the struct never points at closed handles on failure.
 func (db *DB) reopenLocked() error {
+	return db.reopenLockedWithBarrier(false)
+}
+
+// reopenLockedWithBarrier reopens both pools and leaves writerClosed in the
+// requested state. Staged compaction reopens the installed archive with the
+// barrier kept up so no write can land before the replacement commits; every
+// other caller clears the barrier.
+func (db *DB) reopenLockedWithBarrier(keepWriterBarrier bool) error {
 	writer, err := sql.Open(
 		"sqlite3", makeDSN(db.path, false),
 	)
@@ -4735,9 +4824,10 @@ func (db *DB) reopenLocked() error {
 	oldWriter := db.writer.Swap(writer)
 	oldReader := db.reader.Swap(reader)
 	// Reopen fully restores the writer pool, so clear any writer-closed barrier
-	// a prior CloseWriter set. Without this a resync swap that ran behind the
-	// worker write barrier would reopen the pool yet keep rejecting writes.
-	db.writerClosed.Store(false)
+	// a prior CloseWriter set unless the caller keeps it. Without the clear a
+	// resync swap that ran behind the worker write barrier would reopen the
+	// pool yet keep rejecting writes.
+	db.writerClosed.Store(keepWriterBarrier)
 
 	// Retire the just-swapped pools. Concurrent readers that
 	// loaded the old pointer before the swap may still have
@@ -4979,4 +5069,19 @@ func (db *DB) GetOrCreateSyncState(key, defaultValue string) (string, error) {
 		"SELECT value FROM pg_sync_state WHERE key = ?", key,
 	).Scan(&value)
 	return value, err
+}
+
+// SetExtractCandidateFindingsAllowed selects the secret-findings tier that
+// gates recall extraction on this archive: false (default) excludes a session
+// on any recorded finding, true on definite-confidence findings only. The
+// extraction manager sets it from configuration; the eligibility, guard,
+// activation and reconciliation queries all read it.
+func (db *DB) SetExtractCandidateFindingsAllowed(allow bool) {
+	db.extractAllowCandidateFindings.Store(allow)
+}
+
+// ExtractCandidateFindingsAllowed reports the current policy; see
+// SetExtractCandidateFindingsAllowed.
+func (db *DB) ExtractCandidateFindingsAllowed() bool {
+	return db.extractAllowCandidateFindings.Load()
 }

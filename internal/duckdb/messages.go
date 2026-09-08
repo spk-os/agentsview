@@ -27,6 +27,7 @@ func (s *Store) GetMessages(
 		SELECT id, session_id, ordinal, role, content, thinking_text,
 			timestamp, has_thinking, has_tool_use, content_length,
 			is_system, model, token_usage, context_tokens, output_tokens,
+			provider_id,
 			has_context_tokens, has_output_tokens, claude_message_id,
 			claude_request_id, source_type, source_subtype, prompt_source, source_uuid,
 			source_parent_uuid, is_sidechain, is_compact_boundary
@@ -90,6 +91,7 @@ func (s *Store) getMessagesLinearRoleFiltered(
 		SELECT id, session_id, ordinal, role, content, thinking_text,
 			timestamp, has_thinking, has_tool_use, content_length,
 			is_system, model, token_usage, context_tokens, output_tokens,
+			provider_id,
 			has_context_tokens, has_output_tokens, claude_message_id,
 			claude_request_id, source_type, source_subtype, prompt_source, source_uuid,
 			source_parent_uuid, is_sidechain, is_compact_boundary
@@ -127,6 +129,7 @@ func (s *Store) getMessagesAroundAnchor(
 		SELECT id, session_id, ordinal, role, content, thinking_text,
 			timestamp, has_thinking, has_tool_use, content_length,
 			is_system, model, token_usage, context_tokens, output_tokens,
+			provider_id,
 			has_context_tokens, has_output_tokens, claude_message_id,
 			claude_request_id, source_type, source_subtype, prompt_source, source_uuid,
 			source_parent_uuid, is_sidechain, is_compact_boundary
@@ -145,6 +148,7 @@ func (s *Store) getMessagesAroundAnchor(
 		SELECT id, session_id, ordinal, role, content, thinking_text,
 			timestamp, has_thinking, has_tool_use, content_length,
 			is_system, model, token_usage, context_tokens, output_tokens,
+			provider_id,
 			has_context_tokens, has_output_tokens, claude_message_id,
 			claude_request_id, source_type, source_subtype, prompt_source, source_uuid,
 			source_parent_uuid, is_sidechain, is_compact_boundary
@@ -158,6 +162,7 @@ func (s *Store) getMessagesAroundAnchor(
 		SELECT id, session_id, ordinal, role, content, thinking_text,
 			timestamp, has_thinking, has_tool_use, content_length,
 			is_system, model, token_usage, context_tokens, output_tokens,
+			provider_id,
 			has_context_tokens, has_output_tokens, claude_message_id,
 			claude_request_id, source_type, source_subtype, prompt_source, source_uuid,
 			source_parent_uuid, is_sidechain, is_compact_boundary
@@ -214,6 +219,7 @@ func (s *Store) GetAllMessages(ctx context.Context, sessionID string) ([]db.Mess
 		SELECT id, session_id, ordinal, role, content, thinking_text,
 			timestamp, has_thinking, has_tool_use, content_length,
 			is_system, model, token_usage, context_tokens, output_tokens,
+			provider_id,
 			has_context_tokens, has_output_tokens, claude_message_id,
 			claude_request_id, source_type, source_subtype, prompt_source, source_uuid,
 			source_parent_uuid, is_sidechain, is_compact_boundary
@@ -278,6 +284,7 @@ func scanMessages(rows *sql.Rows) ([]db.Message, error) {
 			&m.ThinkingText, &ts, &m.HasThinking, &m.HasToolUse,
 			&m.ContentLength, &m.IsSystem, &m.Model, &tokenUsage,
 			&m.ContextTokens, &m.OutputTokens,
+			&m.ProviderID,
 			&m.HasContextTokens, &m.HasOutputTokens,
 			&m.ClaudeMessageID, &m.ClaudeRequestID,
 			&m.SourceType, &m.SourceSubtype, &m.PromptSource, &m.SourceUUID,
@@ -286,7 +293,12 @@ func scanMessages(rows *sql.Rows) ([]db.Message, error) {
 			return nil, fmt.Errorf("scanning duckdb message: %w", err)
 		}
 		m.Timestamp = formatDBTime(ts)
-		m.TokenUsage = []byte(tokenUsage)
+		// This assigned []byte(tokenUsage) unconditionally, so the ""
+		// nearly every row holds became a non-nil, zero-length
+		// jsontext.Value and every duckdb serve response failed to
+		// marshal. Validation happens only here, on read (see
+		// db.DecodeStoredTokenUsage).
+		m.TokenUsage = db.DecodeStoredTokenUsage(tokenUsage)
 		msgs = append(msgs, m)
 	}
 	return msgs, rows.Err()
@@ -342,7 +354,13 @@ func (s *Store) attachToolCalls(ctx context.Context, msgs []db.Message) error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	return s.attachToolResultEvents(ctx, msgs, index, sessionID)
+	if err := s.attachToolResultEvents(ctx, msgs, index, sessionID); err != nil {
+		return err
+	}
+	// Mirrors the SQLite load boundary: a summary the call's single result
+	// event already carries is not stored, so refill it here.
+	db.RestoreMessageResultContent(msgs)
+	return nil
 }
 
 func (s *Store) attachToolResultEvents(

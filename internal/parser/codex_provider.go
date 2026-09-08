@@ -3,16 +3,23 @@ package parser
 import (
 	"context"
 	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"time"
+
+	"go.kenn.io/agentsview/internal/pathutil"
 )
 
 var _ Provider = (*codexProvider)(nil)
 var _ ActivityHintProvider = (*codexProvider)(nil)
+var _ S3Provider = (*codexProvider)(nil)
+var _ RawCaptureProvider = (*codexProvider)(nil)
+var _ RawCaptureSourceProvider = (*codexProvider)(nil)
+var _ StreamingRawCaptureSourceProvider = (*codexProvider)(nil)
 
 // codexProviderSpec parameterizes the one shared Codex-format provider
 // implementation for Codex and its TraeX fork. Both reuse the same
@@ -73,17 +80,25 @@ func (f *codexProviderFactory) Definition() AgentDef {
 }
 
 func (f *codexProviderFactory) Capabilities() Capabilities {
-	return codexProviderCapabilities()
+	caps := codexProviderCapabilities()
+	if f.spec.agent == AgentCodex {
+		caps.Source.S3Discovery = CapabilitySupported
+	} else {
+		caps.RawCapture = RawCaptureCapabilities{}
+	}
+	return caps
 }
 
 func (f *codexProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	cfg = cfg.Clone()
+	sources := newCodexSourceSet(f.spec.agent, cfg.Roots)
+	sources.metadata = CodexMetadata{roots: cfg.MetadataDirs}
 	return &codexProvider{
 		Def:             cloneAgentDef(f.def),
-		Caps:            codexProviderCapabilities(),
+		Caps:            f.Capabilities(),
 		Config:          cfg,
 		spec:            f.spec,
-		sources:         newCodexSourceSet(f.spec.agent, cfg.Roots),
+		sources:         sources,
 		cursorCache:     f.cursorCache,
 		parentTurnCache: f.parentTurnCache,
 	}
@@ -105,6 +120,67 @@ func (p *codexProvider) DiscoverEach(ctx context.Context, yield func(SourceRef) 
 	return p.sources.DiscoverEach(ctx, yield)
 }
 
+func (p *codexProvider) DiscoverRawCaptureSourcesEach(
+	ctx context.Context,
+	yield func(SourceRef) error,
+) (bool, error) {
+	ctx = withRawCaptureStreamingTraversal(ctx)
+	var incomplete error
+	for _, root := range p.sources.roots {
+		if err := ReportRawCaptureDiscoveryProgress(ctx); err != nil {
+			return false, err
+		}
+		if isS3URI(root) {
+			continue
+		}
+		err := p.sources.discoverEachRoot(ctx, root, yield)
+		if err == nil {
+			continue
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, ctxErr
+		}
+		rootErr, ok := rawCaptureIncompleteRootError(p.Def.Type, root, err)
+		if !ok {
+			return false, err
+		}
+		incomplete = errors.Join(incomplete, rootErr)
+	}
+	return incomplete == nil, incomplete
+}
+
+func (p *codexProvider) RawCaptureSourcesForChangedPath(
+	ctx context.Context,
+	req ChangedPathRequest,
+) ([]SourceRef, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if p.sources.ownsCodexSidecars() &&
+		filepath.Base(req.Path) == CodexSessionIndexFilename {
+		return nil, nil
+	}
+	roots := p.sources.roots
+	if req.WatchRoot != "" {
+		roots = nil
+		for _, root := range p.sources.roots {
+			if samePath(root, req.WatchRoot) {
+				roots = append(roots, root)
+			}
+		}
+	}
+	for _, root := range roots {
+		source, ok := p.sources.sourceRef(root, req.Path, true)
+		if !ok {
+			source, ok = p.sources.directPathSource(root, req.Path, true)
+		}
+		if ok {
+			return []SourceRef{source}, nil
+		}
+	}
+	return nil, nil
+}
+
 func (p *codexProvider) WatchPlan(ctx context.Context) (WatchPlan, error) {
 	return p.sources.WatchPlan(ctx)
 }
@@ -121,12 +197,21 @@ func (p *codexProvider) ActivityHintSources(
 		if strings.HasPrefix(root, "s3://") {
 			continue
 		}
-		path := filepath.Join(filepath.Dir(filepath.Clean(root)), "history.jsonl")
-		if _, ok := seen[path]; ok {
-			continue
+		// Alias homes share the transcripts but may keep their own hint
+		// log, so every sidecar directory contributes. Resolve links so a
+		// shared history.jsonl is read once.
+		for _, dir := range p.sources.metadata.dirs(root) {
+			path := filepath.Join(dir, "history.jsonl")
+			key := path
+			if resolved, err := filepath.EvalSymlinks(path); err == nil {
+				key = resolved
+			}
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			sources = append(sources, ActivityHintSource{Path: path})
 		}
-		seen[path] = struct{}{}
-		sources = append(sources, ActivityHintSource{Path: path})
 	}
 	return sources, nil
 }
@@ -238,6 +323,75 @@ func (p *codexProvider) Fingerprint(
 	return p.sources.Fingerprint(ctx, source)
 }
 
+func (p *codexProvider) PlanRawCapture(
+	ctx context.Context,
+	source SourceRef,
+) (RawCapturePlan, error) {
+	if err := ctx.Err(); err != nil {
+		return RawCapturePlan{}, err
+	}
+	if p.spec.agent != AgentCodex {
+		return RawCapturePlan{}, invalidRawCapturePlan("provider does not own Codex raw companions")
+	}
+	src, ok := source.Opaque.(codexSource)
+	if !ok || src.Root == "" || src.Path == "" || isS3URI(src.Root) {
+		return RawCapturePlan{}, invalidRawCapturePlan("codex source is not a local discovered transcript")
+	}
+	captureRoot := filepath.Clean(src.Root)
+	indexPath := codexSessionIndexPath(src.Path)
+	if indexPath != "" {
+		// The provider reads this named sibling as session metadata, so raw
+		// capture widens only far enough to preserve the same parse inputs.
+		captureRoot = filepath.Dir(indexPath)
+	}
+	rel, err := filepath.Rel(captureRoot, src.Path)
+	if err != nil {
+		return RawCapturePlan{}, invalidRawCapturePlan(
+			"resolve Codex source path: %s", rawCaptureFilesystemError(err),
+		)
+	}
+	entries := []RawCaptureEntry{{
+		Path:       filepath.ToSlash(rel),
+		LocalPath:  src.Path,
+		Appendable: true,
+	}}
+	var sidecarRoots []string
+	for i, candidate := range p.sources.metadata.IndexPaths(src.Path) {
+		info, err := os.Stat(candidate)
+		switch {
+		case err == nil && info.Mode().IsRegular():
+			// The home's own index keeps its name; each alias home's index
+			// is captured under a distinct logical path so parse inputs
+			// that came from another home travel with the transcript.
+			logical := CodexSessionIndexFilename
+			if i > 0 {
+				logical = fmt.Sprintf("alias-homes/%d/%s", i, CodexSessionIndexFilename)
+			}
+			if filepath.Dir(candidate) != captureRoot {
+				sidecarRoots = append(sidecarRoots, filepath.Dir(candidate))
+			}
+			entries = append(entries, RawCaptureEntry{
+				Path:      logical,
+				LocalPath: candidate,
+			})
+		case errors.Is(err, os.ErrNotExist):
+		case err != nil:
+			return RawCapturePlan{}, invalidRawCapturePlan(
+				"stat Codex session index: %s", rawCaptureFilesystemError(err),
+			)
+		default:
+			return RawCapturePlan{}, invalidRawCapturePlan("Codex session index is not a regular file")
+		}
+	}
+	return RawCapturePlan{
+		ConfiguredRoot: src.Root,
+		CaptureRoot:    captureRoot,
+		SourceKey:      source.Key,
+		Entries:        entries,
+		SidecarRoots:   sidecarRoots,
+	}, nil
+}
+
 // ComputeMultiFileStatHash implements parser.MultiFileStatHasher over the
 // rollout transcript plus its session_index.jsonl sidecar, mirroring the
 // sidecar folding of the verified-source gate: an index-only change (a
@@ -249,7 +403,11 @@ func (p *codexProvider) Fingerprint(
 // process restarts, sparing a fresh engine the full-content hash that
 // Fingerprint performs for every unchanged rollout.
 func (p *codexProvider) ComputeMultiFileStatHash(chatPath string) uint64 {
-	return fileStatTupleDigest(0xC2, chatPath, codexSessionIndexPath(chatPath))
+	paths := append([]string{chatPath}, p.sources.metadata.IndexPaths(chatPath)...)
+	if len(paths) == 1 {
+		paths = append(paths, "")
+	}
+	return fileStatTupleDigest(0xC2, paths...)
 }
 
 func (p *codexProvider) Parse(
@@ -264,7 +422,9 @@ func (p *codexProvider) Parse(
 		return ParseOutcome{}, fmt.Errorf("codex source path unavailable")
 	}
 	if req.ForceParse && p.spec.agent == AgentCodex {
-		EvictCodexSessionIndexForSession(path)
+		for _, index := range p.sources.metadata.IndexPaths(path) {
+			EvictCodexSessionIndex(index)
+		}
 	}
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
 	parentID, parentResolved := p.codexParentResolution(ctx, path)
@@ -426,8 +586,9 @@ type codexSourceSet struct {
 	// agent labels the sources this set emits. Codex-format forks share
 	// the layout but must not share a discovery namespace: keying sources
 	// by agent keeps a TraeX UUID from colliding with a Codex one.
-	agent AgentType
-	roots []string
+	agent    AgentType
+	roots    []string
+	metadata CodexMetadata
 }
 
 func newCodexSourceSet(agent AgentType, roots []string) codexSourceSet {
@@ -441,8 +602,8 @@ func newCodexSourceSet(agent AgentType, roots []string) codexSourceSet {
 // owns Codex's out-of-band files: the session_index.jsonl sidecar and the
 // s3://.../raw/codex/... archive layout. Only Codex does. A fork writes
 // neither, so it must not watch, fan out on, or import them -- importing an
-// s3:// root through discoverCodexS3 would stamp AgentCodex and silently move
-// the sessions into Codex's identity namespace.
+// s3:// root through the Codex S3 scanner would stamp AgentCodex and silently
+// move the sessions into Codex's identity namespace.
 func (s codexSourceSet) ownsCodexSidecars() bool {
 	return s.agent == AgentCodex
 }
@@ -458,40 +619,49 @@ func (s codexSourceSet) DiscoverEach(
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if strings.HasPrefix(root, "s3://") {
-			if !s.ownsCodexSidecars() {
-				continue
-			}
-			for _, file := range discoverCodexS3(root) {
-				if err := yield(s3SourceRefFromDiscoveredFile(root, file)); err != nil {
-					return err
-				}
-			}
-			continue
-		}
-		err := streamDirectoryTree(ctx, root, func(path string, entry os.DirEntry) error {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			if !isCodexSessionFilename(entry.Name()) {
-				return nil
-			}
-			source, ok := s.sourceRef(root, path, true)
-			if !ok {
-				if _, _, supported := CodexSessionPathInfo(root, path); supported {
-					source, ok = s.directPathSource(root, path, true)
-				}
-			}
-			if !ok {
-				return nil
-			}
-			return yield(source)
-		})
-		if err != nil {
+		if err := s.discoverEachRoot(ctx, root, yield); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (s codexSourceSet) discoverEachRoot(
+	ctx context.Context,
+	root string,
+	yield func(SourceRef) error,
+) error {
+	if strings.HasPrefix(root, "s3://") {
+		if !s.ownsCodexSidecars() {
+			return nil
+		}
+		for _, file := range s3PrefixScan(root, codexS3Scanner()) {
+			if err := yield(s3SourceRefFromDiscoveredFile(root, file)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return streamDirectoryTree(ctx, root, func(path string, entry os.DirEntry) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !isCodexSessionFilename(entry.Name()) || !entry.Type().IsRegular() {
+			return nil
+		}
+		// ReadDir already classified the entry without following symlinks.
+		// Reuse that result instead of issuing another lstat per rollout.
+		source, ok := s.sourceRef(root, path, false)
+		if !ok {
+			if _, _, supported := CodexSessionPathInfo(root, path); supported {
+				source, ok = s.directPathSource(root, path, false)
+			}
+		}
+		if !ok {
+			return nil
+		}
+		return yield(source)
+	})
 }
 
 func (s codexSourceSet) discover(
@@ -516,7 +686,7 @@ func (s codexSourceSet) discover(
 			if !s.ownsCodexSidecars() {
 				continue
 			}
-			for _, file := range discoverCodexS3(root) {
+			for _, file := range s3PrefixScan(root, codexS3Scanner()) {
 				source := s3SourceRefFromDiscoveredFile(root, file)
 				if _, ok := byKey[source.Key]; ok {
 					continue
@@ -650,6 +820,9 @@ func (s codexSourceSet) WatchPlan(context.Context) (WatchPlan, error) {
 	roots := make([]WatchRoot, 0, len(s.roots)*2)
 	seenShallow := make(map[string]struct{})
 	for _, root := range s.roots {
+		if isS3URI(root) {
+			continue
+		}
 		roots = append(roots, WatchRoot{
 			Path:         root,
 			Recursive:    true,
@@ -659,7 +832,8 @@ func (s codexSourceSet) WatchPlan(context.Context) (WatchPlan, error) {
 		if !s.ownsCodexSidecars() {
 			continue
 		}
-		for _, shallow := range ResolveCodexShallowWatchRoots(root) {
+		shallowRoots := s.metadata.dirs(root)
+		for _, shallow := range shallowRoots {
 			shallow = filepath.Clean(shallow)
 			if _, ok := seenShallow[shallow]; ok {
 				continue
@@ -775,7 +949,7 @@ func (s codexSourceSet) Fingerprint(
 	inode, device := sourceFileIdentity(info)
 	mtime := info.ModTime().UnixNano()
 	if s.agent == AgentCodex {
-		mtime = CodexEffectiveMtime(path, mtime)
+		mtime = s.metadata.EffectiveMtime(path, mtime)
 	}
 	return SourceFingerprint{
 		Key:     firstNonEmptyJSONLString(source.FingerprintKey, source.Key, path),
@@ -826,7 +1000,7 @@ func (s codexSourceSet) sourcesForIndexPath(
 	}
 	indexDir := filepath.Dir(indexPath)
 	return s.discover(ctx, func(root string) bool {
-		return filepath.Dir(root) == indexDir
+		return slices.Contains(s.metadata.dirs(root), indexDir)
 	})
 }
 
@@ -891,7 +1065,8 @@ func (s codexSourceSet) canonicalSource(
 	if !ok || src.UUID == "" {
 		return source, true, nil
 	}
-	best := source
+	var best SourceRef
+	foundExisting := false
 	for _, root := range s.roots {
 		if err := ctx.Err(); err != nil {
 			return SourceRef{}, false, err
@@ -904,9 +1079,13 @@ func (s codexSourceSet) canonicalSource(
 		if !ok {
 			continue
 		}
-		if preferCodexSource(candidate, best) {
+		if !foundExisting || preferCodexSource(candidate, best) {
 			best = candidate
+			foundExisting = true
 		}
+	}
+	if !foundExisting {
+		return source, true, nil
 	}
 	return best, true, nil
 }
@@ -1009,5 +1188,20 @@ func codexProviderCapabilities() Capabilities {
 			FingerprintHashRequiredForFreshness: true,
 			SkipCacheFreshWithoutStoredRow:      true,
 		},
+		RawCapture: RawCaptureCapabilities{
+			Support:  CapabilitySupported,
+			Shape:    RawCaptureShapeFiles,
+			Append:   RawCaptureAppendOne,
+			Snapshot: RawCaptureSnapshotNone,
+		},
 	}
+}
+
+func (p *codexProvider) Metadata() CodexMetadata { return p.sources.metadata }
+
+func (f *codexProviderFactory) ResolveMetadataDir(path string) (string, error) {
+	if f.spec.agent != AgentCodex {
+		return "", nil
+	}
+	return pathutil.ResolveAbsolute(filepath.Dir(path))
 }

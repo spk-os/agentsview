@@ -1384,6 +1384,12 @@ func TestResyncProgressPrinterWritesPhaseTimingsOnNewLines(t *testing.T) {
 	})
 	now = now.Add(350 * time.Millisecond)
 	printer.Print(agentsync.Progress{
+		Phase:  agentsync.PhaseFinalizing,
+		Detail: "Finalizing sync: committing session writes",
+		Resync: true,
+	})
+	now = now.Add(500 * time.Millisecond)
+	printer.Print(agentsync.Progress{
 		Phase:  agentsync.PhaseRebuildingSearch,
 		Detail: "Rebuilding search index",
 		Hint:   "Rebuilding the search index may take a while on large archives.",
@@ -1401,6 +1407,12 @@ func TestResyncProgressPrinterWritesPhaseTimingsOnNewLines(t *testing.T) {
 	assert.Contains(t, got, "  Preparing full resync completed in 150ms\n")
 	assert.Contains(t, got, "\r  Syncing sessions into rebuilt database: 10/10 sessions (100%) · 100 messages\x1b[K")
 	assert.Contains(t, got, "\n  Syncing sessions into rebuilt database completed in 2.35s\n")
+	assert.Contains(t, got,
+		"  Finalizing sync: committing session writes...\n")
+	assert.Contains(t, got,
+		"  Finalizing sync: committing session writes completed in 500ms\n")
+	assert.NotContains(t, got,
+		"\r  Finalizing sync: committing session writes")
 	assert.Contains(t, got, "  Rebuilding search index - Rebuilding the search index may take a while on large archives...\n")
 	assert.Contains(t, got, "  Rebuilding search index completed in 3s\n")
 	assert.NotContains(t, got, "\r  Rebuilding search index",
@@ -1799,6 +1811,73 @@ func TestRunDaemonSyncTrimsBaseURLTrailingSlash(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, syncCalled)
 	assert.Equal(t, 7, stats.Synced)
+}
+
+func TestRunDaemonSyncWaitsForBusyEngine(t *testing.T) {
+	for _, cancelWait := range []bool{false, true} {
+		t.Run(strconv.FormatBool(cancelWait), func(t *testing.T) {
+			database := dbtest.OpenTestDB(t)
+			engine := agentsync.NewEngine(database, agentsync.EngineConfig{})
+			t.Cleanup(engine.Close)
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			done := make(chan error, 1)
+			var releaseOnce stdsync.Once
+			unblock := func() { releaseOnce.Do(func() { close(release) }) }
+			go func() {
+				done <- engine.RunExclusive(func() error {
+					close(entered)
+					<-release
+					return nil
+				})
+			}()
+			<-entered
+			defer func() {
+				unblock()
+				require.NoError(t, <-done)
+			}()
+
+			var runs atomic.Int32
+			ts := httptest.NewUnstartedServer(nil)
+			defer ts.Close()
+			cfg := config.Config{Host: "127.0.0.1", Port: ts.Listener.Addr().(*net.TCPAddr).Port}
+			srv := server.New(cfg, database, engine,
+				server.WithLocalSyncRunner(func(context.Context, func(agentsync.Progress)) (agentsync.SyncStats, error) {
+					err := engine.TryRunExclusive(func() error {
+						runs.Add(1)
+						return nil
+					})
+					return agentsync.SyncStats{Synced: 7}, err
+				}),
+			)
+			ts.Config.Handler = srv.Handler()
+			ts.Start()
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			var waiting bool
+			stats, err := runDaemonSync(ctx, transport{URL: ts.URL}, "", false,
+				func(p agentsync.Progress) {
+					waiting = true
+					assert.Contains(t, p.Detail, "Waiting")
+					assert.Zero(t, runs.Load(), "waiting must not run overlapping work")
+					if cancelWait {
+						cancel()
+					} else {
+						unblock()
+					}
+				},
+			)
+			assert.True(t, waiting, "the CLI must receive progress while the engine is busy")
+			if cancelWait {
+				assert.ErrorIs(t, err, context.Canceled)
+				assert.Zero(t, runs.Load())
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, 7, stats.Synced)
+				assert.EqualValues(t, 1, runs.Load())
+			}
+		})
+	}
 }
 
 // TestRunDaemonSyncDetectsResyncRequired pins the stale-archive UX: only a

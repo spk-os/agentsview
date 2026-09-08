@@ -12,12 +12,14 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/thlib/go-timezone-local/tzlocal"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/cursorusage"
 	"go.kenn.io/agentsview/internal/db"
@@ -27,6 +29,7 @@ import (
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/parsertest"
 	"go.kenn.io/agentsview/internal/pricingrefresh"
+	"go.kenn.io/agentsview/internal/timeutil"
 )
 
 var goldenFixtureNow = time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
@@ -158,7 +161,7 @@ func TestUsageDailyGolden(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(stdout), &report))
 	assert.Equal(t, export.UsageDailySchemaVersion, report.SchemaVersion)
 
-	assertCatalogGolden(t, "usage_daily_v5.json", []byte(stdout))
+	assertCatalogGolden(t, "usage_daily_v6.json", []byte(stdout))
 }
 
 func TestUsageDailyBreakdownGolden(t *testing.T) {
@@ -188,7 +191,7 @@ func TestUsageDailyBreakdownGolden(t *testing.T) {
 		assert.Equal(t, "golden-host", daily.MachineBreakdowns[0].MachineName)
 	}
 
-	assertCatalogGolden(t, "usage_daily_breakdown_v5.json", []byte(stdout))
+	assertCatalogGolden(t, "usage_daily_breakdown_v6.json", []byte(stdout))
 }
 
 func setupExportGoldenDataDir(t *testing.T) string {
@@ -203,7 +206,7 @@ func setupExportGoldenDataDir(t *testing.T) string {
 	database := dbtest.OpenTestDBAt(t, dbPath)
 	seedExportGoldenArchive(t, database)
 	require.NoError(t, database.Close(), "close golden database")
-	setGoldenPricingUpdatedAt(t, dbPath)
+	setGoldenExportTimestamps(t, dbPath)
 	return dataDir
 }
 
@@ -410,16 +413,19 @@ func seedGoldenExportSession(
 	}
 }
 
-func setGoldenPricingUpdatedAt(t *testing.T, dbPath string) {
+func setGoldenExportTimestamps(t *testing.T, dbPath string) {
 	t.Helper()
 	conn, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err, "open golden db for pricing timestamp")
 	defer func() {
 		require.NoError(t, conn.Close(), "close pricing timestamp db")
 	}()
-	_, err = conn.Exec(`UPDATE model_pricing SET updated_at = ?`,
-		goldenPricingUpdatedAt)
-	require.NoError(t, err, "set deterministic pricing updated_at")
+	_, err = conn.Exec(`
+		UPDATE model_pricing SET updated_at = ?;
+		UPDATE genai_pricing SET updated_at = ?;
+		UPDATE sessions SET local_modified_at = ?`,
+		goldenPricingUpdatedAt, goldenPricingUpdatedAt, "2026-07-03T12:00:00.123Z")
+	require.NoError(t, err, "set deterministic export timestamps")
 }
 
 func assertGoldenBytes(t *testing.T, name string, got []byte) {
@@ -583,6 +589,127 @@ func TestFetchHTTPDailyUsage(t *testing.T) {
 	assert.Equal(t, 10, got.Totals.InputTokens)
 	assert.Equal(t, 20, got.Daily[0].OutputTokens)
 	assert.Equal(t, 1, got.SessionCounts.Total)
+}
+
+func TestLocalTimezoneWindowsNameProducesServerAcceptedUsageQuery(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("requires the Windows local timezone resolver")
+	}
+	previousTZ, hadTZ := os.LookupEnv("TZ")
+	require.NoError(t, os.Unsetenv("TZ"))
+	t.Cleanup(func() {
+		if hadTZ {
+			_ = os.Setenv("TZ", previousTZ)
+		} else {
+			_ = os.Unsetenv("TZ")
+		}
+	})
+	oldLocal := time.Local
+	time.Local = time.FixedZone("Eastern Standard Time", -5*60*60)
+	t.Cleanup(func() { time.Local = oldLocal })
+	expected, err := tzlocal.LocalTZ()
+	require.NoError(t, err)
+	require.NotEmpty(t, expected)
+
+	var gotTimezones []string
+	ts := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter, r *http.Request,
+	) {
+		tz := r.URL.Query().Get("timezone")
+		gotTimezones = append(gotTimezones, tz)
+		if tz == "Eastern Standard Time" {
+			w.WriteHeader(http.StatusBadRequest)
+			writeJSONResponse(w, `{"error":"invalid timezone: Eastern Standard Time"}`)
+			return
+		}
+		if tz != expected {
+			w.WriteHeader(http.StatusBadRequest)
+			writeJSONResponse(w, `{"error":"invalid timezone: `+tz+`"}`)
+			return
+		}
+		writeJSONResponse(w, sampleDailyUsageJSON)
+	}))
+	t.Cleanup(ts.Close)
+
+	base, err := fetchHTTPDailyUsage(context.Background(), transport{URL: ts.URL}, "",
+		dailyUsageQuery{Filter: db.UsageFilter{
+			Timezone: time.Now().Location().String(),
+		}, NoDefaultRange: true})
+	assert.Equal(t, db.DailyUsageResult{}, base)
+	require.EqualError(t, err,
+		`usage summary: HTTP 400: {"error":"invalid timezone: Eastern Standard Time"}`)
+	t.Logf("base: timezone=%q error=%v", gotTimezones[0], err)
+
+	head, err := fetchHTTPDailyUsage(context.Background(), transport{URL: ts.URL}, "",
+		dailyUsageQuery{Filter: db.UsageFilter{
+			Timezone: localTimezone(),
+		}, NoDefaultRange: true})
+	require.NoError(t, err)
+	require.Len(t, head.Daily, 1)
+	assert.Equal(t, expected, gotTimezones[1])
+	t.Logf("head: timezone=%q status=200 daily=%d", gotTimezones[1], len(head.Daily))
+}
+
+func TestUsageDateForTimezoneFallsBackToUTC(t *testing.T) {
+	now := time.Date(2026, 7, 3, 22, 30, 0, 0, time.FixedZone("local", -5*60*60))
+	assert.Equal(t, "2026-07-03", usageDateForTimezone(now, "America/New_York"))
+	assert.Equal(t, "2026-07-04", usageDateForTimezone(now, "UTC"))
+	assert.Equal(t, "2026-07-04", usageDateForTimezone(now, "not/a-zone"))
+}
+
+func TestRunUsageDailyDefaultsToMappedLocalTimezone(t *testing.T) {
+	t.Setenv("TZ", "America/New_York")
+	oldLocal := time.Local
+	time.Local = time.FixedZone("Eastern Standard Time", -5*60*60)
+	t.Cleanup(func() { time.Local = oldLocal })
+	dataDir := newAgentDataDir(t)
+	var gotTimezone string
+	ts := sessionUsageRuntimeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotTimezone = r.URL.Query().Get("timezone")
+		writeJSONResponse(w, sampleDailyUsageJSON)
+	})
+	registerSyncRouteTestRuntime(t, dataDir, ts.URL)
+
+	captureStdout(t, func() {
+		runUsageDaily(UsageDailyConfig{JSON: true, Offline: false})
+	})
+	assert.Equal(t, "America/New_York", gotTimezone)
+}
+
+func TestRunUsageStatuslineDefaultsToMappedLocalTimezone(t *testing.T) {
+	t.Setenv("TZ", "America/New_York")
+	oldLocal := time.Local
+	time.Local = time.FixedZone("Eastern Standard Time", -5*60*60)
+	t.Cleanup(func() { time.Local = oldLocal })
+	dataDir := newAgentDataDir(t)
+	var gotTimezone string
+	ts := sessionUsageRuntimeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotTimezone = r.URL.Query().Get("timezone")
+		writeJSONResponse(w, sampleDailyUsageJSON)
+	})
+	registerSyncRouteTestRuntime(t, dataDir, ts.URL)
+
+	captureStdout(t, func() {
+		runUsageStatusline(UsageStatuslineConfig{JSON: true})
+	})
+	assert.Equal(t, "America/New_York", gotTimezone)
+}
+
+func TestCursorUsageWindowUsesMappedLocalTimezone(t *testing.T) {
+	t.Setenv("TZ", "America/New_York")
+	oldLocal := time.Local
+	time.Local = time.FixedZone("Eastern Standard Time", -5*60*60)
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	loc := timeutil.LocalLocation()
+	assert.Equal(t, "America/New_York", loc.String())
+	start, end, err := resolveCursorUsageWindow(UsageCursorConfig{
+		Since: "2026-03-08", Until: "2026-03-08",
+	}, loc)
+	require.NoError(t, err)
+	assert.Equal(t, time.Date(2026, 3, 8, 5, 0, 0, 0, time.UTC), start)
+	assert.Equal(t,
+		time.Date(2026, 3, 9, 3, 59, 59, 999000000, time.UTC), end)
 }
 
 func TestFetchHTTPDailyUsageMissingProjectsDefaultsEmptyMap(t *testing.T) {
@@ -1569,7 +1696,7 @@ func TestNewUsageCursorCommandExplicitMemberFilterDoesNotReuseConfigSibling(t *t
 // sampleDailyUsageJSON is a full usage summary body with a single day and
 // non-zero totals, shared by the HTTP and daemon usage tests.
 const sampleDailyUsageJSON = `{
-	"schema_version": 5,
+	"schema_version": 6,
 	"from": "2026-06-01",
 	"to": "2026-06-02",
 	"pricing": {

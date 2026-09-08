@@ -35,6 +35,10 @@ type ContentSearchFilter struct {
 	Project, ExcludeProject, Machine, Agent           string
 	Date, DateFrom, DateTo, Timezone, ActiveSince     string
 	IncludeChildren, IncludeAutomated, IncludeOneShot bool
+	// ExcludeSessionIDs drops matches from these session IDs before LIMIT,
+	// so a live conversation cannot fill the result page. Empty entries are
+	// ignored; unknown IDs are a no-op.
+	ExcludeSessionIDs []string
 	// GitBranch is a branchListSep-joined list of opaque (project, branch) tokens (EncodeBranchFilterToken).
 	GitBranch string
 
@@ -139,7 +143,50 @@ func contentSessionFilter(f ContentSearchFilter) SessionFilter {
 // (no LIMIT in a SELECT id subquery), so they are left unset.
 func sessionScopeSubquery(f ContentSearchFilter) (string, []any) {
 	where, args := buildSessionFilter(contentSessionFilter(f))
+	where, args = AppendExcludeSessionIDs(where, args, "id", f.ExcludeSessionIDs)
 	return "session_id IN (SELECT id FROM sessions WHERE " + where + ")", args
+}
+
+// NormalizeExcludeSessionIDs trims, drops empty entries, and de-duplicates
+// session IDs while preserving first-seen order. An empty result means no
+// exclusion filter should be applied.
+func NormalizeExcludeSessionIDs(ids []string) []string {
+	if len(ids) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(ids))
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// AppendExcludeSessionIDs adds `<col> NOT IN (...)` to a WHERE clause using
+// `?` placeholders (SQLite and DuckDB). It is a no-op when ids is empty.
+func AppendExcludeSessionIDs(
+	where string, args []any, col string, ids []string,
+) (string, []any) {
+	ids = NormalizeExcludeSessionIDs(ids)
+	if len(ids) == 0 {
+		return where, args
+	}
+	ph, extra := inPlaceholders(ids)
+	out := make([]any, 0, len(args)+len(extra))
+	out = append(out, args...)
+	out = append(out, extra...)
+	return where + " AND " + col + " NOT IN " + ph, out
 }
 
 // semanticContentSessionFilter maps a ContentSearchFilter for the
@@ -161,6 +208,7 @@ func semanticContentSessionFilter(f ContentSearchFilter) SessionFilter {
 // to each session's own row.
 func semanticSessionScopeSubquery(f ContentSearchFilter) (string, []any) {
 	where, args := buildSessionBaseFilter(semanticContentSessionFilter(f))
+	where, args = AppendExcludeSessionIDs(where, args, "id", f.ExcludeSessionIDs)
 	return "session_id IN (SELECT id FROM sessions WHERE " + where + ")", args
 }
 
@@ -562,46 +610,57 @@ func (f ContentSearchFilter) buildSnippet(body string, start, end int) string {
 
 // substringSnippet builds the snippet for a substring match: it locates the
 // case-insensitive pattern in body (the LIKE already matched, so it is present;
-// fall back to the start if case-folding shifts the offset) and windows it.
+// fall back to the start of the body if case-folding cannot locate it) and
+// windows it.
 func (f ContentSearchFilter) substringSnippet(body string) string {
-	off := max(CaseInsensitiveIndex(body, f.Pattern), 0)
-	return f.buildSnippet(body, off, min(off+len(f.Pattern), len(body)))
+	start, end, _ := CaseInsensitiveSpan(body, f.Pattern)
+	return f.buildSnippet(body, start, end)
 }
 
-// CaseInsensitiveIndex returns the byte offset in s of the first
-// case-insensitive occurrence of sub, or -1. The offset always indexes s
-// directly: it walks s rune by rune instead of searching strings.ToLower(s),
-// whose byte length can differ from s — the Kelvin sign U+212A lowercases from
-// three bytes to one, U+023A lowercases from two bytes to three — which would
-// shift the offset and, when ToLower grows the prefix, push it past len(s) so
-// the caller's slice panics. Both backends use it to center snippets.
-func CaseInsensitiveIndex(s, sub string) int {
+// CaseInsensitiveSpan returns the byte range [start, end) that the first
+// case-insensitive occurrence of sub covers in s, and whether one exists;
+// a miss reports the start of s so callers can window from there.
+//
+// Both offsets index s directly: the search walks s rune by rune instead of
+// searching strings.ToLower(s), whose byte length can differ from s — the
+// Kelvin sign U+212A lowercases from three bytes to one, U+023A lowercases
+// from two bytes to three — which would shift the offset and, when ToLower
+// grows the prefix, push it past len(s) so the caller's slice panics.
+//
+// end comes from s for the same reason it cannot come from sub: those same
+// mappings make the matched bytes shorter or longer than sub, so start +
+// len(sub) can land inside a rune of s or past the end of the match. Snippet
+// windowing relies on the span being rune-aligned (see snippetBounds, which
+// snaps only the padding edges), so every backend derives the end here.
+func CaseInsensitiveSpan(s, sub string) (int, int, bool) {
 	if sub == "" {
-		return 0
+		return 0, 0, true
 	}
 	for i := range s {
-		if hasFoldPrefixAt(s, i, sub) {
-			return i
+		if end, ok := foldPrefixEnd(s, i, sub); ok {
+			return i, end, true
 		}
 	}
-	return -1
+	return 0, 0, false
 }
 
-// hasFoldPrefixAt reports whether s[i:] begins with sub under simple Unicode
-// lower-case folding, compared rune by rune so a case mapping that changes
-// UTF-8 byte length cannot desynchronize the two cursors.
-func hasFoldPrefixAt(s string, i int, sub string) bool {
+// foldPrefixEnd reports whether s[i:] begins with sub under simple Unicode
+// lower-case folding and, when it does, the offset in s just past the match.
+// The two strings are compared rune by rune so a case mapping that changes
+// UTF-8 byte length cannot desynchronize the cursors, which is also what
+// leaves the returned end on a rune boundary of s.
+func foldPrefixEnd(s string, i int, sub string) (int, bool) {
 	for _, want := range sub {
 		if i >= len(s) {
-			return false
+			return 0, false
 		}
 		got, size := utf8.DecodeRuneInString(s[i:])
 		if got != want && unicode.ToLower(got) != unicode.ToLower(want) {
-			return false
+			return 0, false
 		}
 		i += size
 	}
-	return true
+	return i, true
 }
 
 // literalPrefix extracts a required literal prefix from a regex for use
@@ -683,21 +742,20 @@ func (f ContentSearchFilter) ftsSnippet(body string) string {
 // first parsed prepared-FTS term, and finally to the start of the body.
 func FTSSnippetRange(pattern, body string) (int, int) {
 	if phrase := strings.Trim(pattern, "\""); phrase != "" {
-		if off := CaseInsensitiveIndex(body, phrase); off >= 0 {
-			return off, min(off+len(phrase), len(body))
+		if start, end, ok := CaseInsensitiveSpan(body, phrase); ok {
+			return start, end
 		}
 	}
 	for _, term := range FTSTerms(PrepareFTSQuery(pattern)) {
 		if term == "" {
 			continue
 		}
-		if off := CaseInsensitiveIndex(body, term); off >= 0 {
-			return off, min(off+len(term), len(body))
+		if start, end, ok := CaseInsensitiveSpan(body, term); ok {
+			return start, end
 		}
 		if fields := strings.Fields(term); len(fields) > 0 && fields[0] != term {
-			first := fields[0]
-			if off := CaseInsensitiveIndex(body, first); off >= 0 {
-				return off, min(off+len(first), len(body))
+			if start, end, ok := CaseInsensitiveSpan(body, fields[0]); ok {
+				return start, end
 			}
 		}
 		break
@@ -1302,6 +1360,7 @@ func (db *DB) semanticAllowedSessionIDs(
 		return nil, nil
 	}
 	where, filterArgs := buildSessionBaseFilter(semanticContentSessionFilter(f))
+	where, filterArgs = AppendExcludeSessionIDs(where, filterArgs, "id", f.ExcludeSessionIDs)
 	query := "SELECT id FROM sessions WHERE " + where + " AND id IN "
 
 	allowed := make(map[string]bool, len(ids))

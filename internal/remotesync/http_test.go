@@ -92,16 +92,20 @@ func TestHTTPSyncRejectsRemoteWithoutProtocolHandshake(t *testing.T) {
 }
 
 func TestHTTPSyncRejectsMismatchedRemoteProtocol(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set(ProtocolHeader, strconv.Itoa(ProtocolVersion+1))
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	t.Cleanup(ts.Close)
+	for _, version := range []string{"1", strconv.Itoa(ProtocolVersion + 1)} {
+		t.Run(version, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set(ProtocolHeader, version)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{}`))
+			}))
+			t.Cleanup(ts.Close)
 
-	_, err := HTTPSync{Host: "devbox", URL: ts.URL}.Prepare(t.Context())
+			_, err := HTTPSync{Host: "devbox", URL: ts.URL}.Prepare(t.Context())
 
-	require.ErrorContains(t, err, "incompatible")
+			require.ErrorContains(t, err, "incompatible")
+		})
+	}
 }
 
 func TestHTTPSyncDownloadsArchiveAndImports(t *testing.T) {
@@ -1013,7 +1017,7 @@ func (r *mirrorTestRemote) addWindsurfFileScopedAgent(t *testing.T) string {
 	require.NoError(t, err)
 	require.NoError(t, conn.Close())
 
-	resolved := ResolveTargets(config.Config{
+	resolved := resolveTargetsForTest(t, config.Config{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentWindsurf: {userRoot},
 		},
@@ -2544,7 +2548,7 @@ func (r *mirrorTestRemote) addRooCodeAgent(
 	mcpSettings := filepath.Join(settingsDir, "mcp_settings.json")
 	require.NoError(t, os.WriteFile(mcpSettings,
 		[]byte(`{"mcpServers":{"s":{"env":{"API_KEY":"sk-secret"}}}}`), 0o644))
-	resolved := ResolveTargets(config.Config{
+	resolved := resolveTargetsForTest(t, config.Config{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentRooCode: {rooRoot},
 		},

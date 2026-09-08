@@ -441,6 +441,14 @@ func devinFingerprintHash(
 		return "", err
 	}
 	if transcriptInfo == nil {
+		if _, err := fmt.Fprintf(
+			h,
+			"main_chain_valid\x00%t\x00main_chain\x00%d\x00",
+			meta.MainChainID.Valid,
+			meta.MainChainID.Int64,
+		); err != nil {
+			return "", err
+		}
 		if err := devinAppendMessageNodesFingerprint(h, dbPath, meta.RawSessionID); err != nil {
 			return "", err
 		}
@@ -545,7 +553,10 @@ func (s devinSourceSet) dbPathForEvent(root, path string) (string, bool) {
 	if !ok || strings.Contains(rel, string(filepath.Separator)) {
 		return "", false
 	}
-	if rel == devinDBFilename || rel == devinDBFilename+"-wal" || rel == devinDBFilename+"-shm" {
+	// A bare "-shm" event is ignored: the provider's own read connections
+	// rewrite that index, and every committed write lands in the main file
+	// or the WAL.
+	if rel == devinDBFilename || rel == devinDBFilename+"-wal" {
 		return filepath.Join(cliRoot, devinDBFilename), true
 	}
 	return "", false

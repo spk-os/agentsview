@@ -27,7 +27,7 @@ func TestUsageCacheGenerationCreatesIdentifiedSchema(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, cache.temporary)
 	assert.Equal(t, filepath.Join(filepath.Dir(archivePath),
-		"usage-cache-v1-980e32c89da32cb0d3588c0c06864b4e.db"), cache.path)
+		"usage-cache-v9-980e32c89da32cb0d3588c0c06864b4e.db"), cache.path)
 
 	info, err := os.Stat(cache.path)
 	require.NoError(t, err)
@@ -43,14 +43,22 @@ func TestUsageCacheGenerationCreatesIdentifiedSchema(t *testing.T) {
 
 	metadata := readUsageCacheMetadata(t, cache.db)
 	assert.Equal(t, "agentsview-usage-facts", metadata[usageCacheMetadataKind])
-	assert.Equal(t, "1", metadata[usageCacheMetadataFormatVersion])
+	assert.Equal(t, "9", metadata[usageCacheMetadataFormatVersion])
 	assert.Equal(t, "database-id-one", metadata[usageCacheMetadataSourceDatabaseID])
+	assert.Equal(t, "1", metadata[usageCacheMetadataRetirementProtocol])
 	assert.Equal(t, "1", metadata[usageCacheMetadataNextInstallRevision])
 	assert.Equal(t, "1", metadata[usageCacheMetadataNextRollupRevision])
 	assert.Equal(t, "0", metadata[usageCacheMetadataDeletionRevision])
 	assert.Equal(t, "0", metadata[usageCacheMetadataCursorHighWaterMark])
 	assert.NotContains(t, metadata, "extractor_version")
 	assert.NotContains(t, metadata, "backfill_progress_session_id")
+
+	var hasPricingTimestamp bool
+	require.NoError(t, cache.db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM pragma_table_info('usage_daily_rollups')
+			WHERE name = 'pricing_timestamp')`,
+	).Scan(&hasPricingTimestamp))
+	assert.True(t, hasPricingTimestamp)
 
 	for table, columns := range map[string][]string{
 		"usage_cached_sessions": {
@@ -233,13 +241,15 @@ func TestUsageCacheGenerationPreservesRecognizedIncompleteCache(t *testing.T) {
 func TestUsageCacheGenerationChangesWithFormatAndDatabaseID(t *testing.T) {
 	dir := t.TempDir()
 	archivePath := filepath.Join(dir, "sessions.db")
-	oldPath := usageCacheGenerationPath(archivePath, 6, "database-id-one")
-	seedRecognizedUsageCache(t, oldPath, 6, "database-id-one")
+	oldPath := usageCacheGenerationPath(archivePath, 4, "database-id-one")
+	seedRecognizedUsageCache(t, oldPath, 4, "database-id-one")
 
 	manager := newUsageCacheManager(archivePath)
 	t.Cleanup(func() { require.NoError(t, manager.Close()) })
 	first, err := manager.Generation(context.Background(), "database-id-one")
 	require.NoError(t, err)
+	require.False(t, first.temporary,
+		"format bump must create a persistent generation")
 	assert.NotEqual(t, oldPath, first.path, "format bump must open a new generation")
 	_, err = os.Stat(oldPath)
 	require.NoError(t, err, "format bump must preserve the old generation")
@@ -316,6 +326,106 @@ func TestUsageCacheGenerationDoesNotDeleteHeldOldGeneration(t *testing.T) {
 	_, err = manager.Generation(context.Background(), "new-database-id")
 	require.NoError(t, err)
 	assert.FileExists(t, oldPath)
+}
+
+func TestUsageCacheGenerationRetiresInactiveCooperatingGeneration(t *testing.T) {
+	dir := t.TempDir()
+	archivePath := filepath.Join(dir, "sessions.db")
+	stalePath := usageCacheGenerationPath(
+		archivePath, usageCacheFormatVersion, "stale-database-id")
+	seedRecognizedUsageCacheWithRetirementProtocol(
+		t, stalePath, usageCacheFormatVersion, "stale-database-id")
+	require.NoError(t, os.WriteFile(stalePath+"-wal", nil, 0o600))
+	require.NoError(t, os.WriteFile(stalePath+"-shm", nil, 0o600))
+
+	manager := newUsageCacheManager(archivePath)
+	t.Cleanup(func() { require.NoError(t, manager.Close()) })
+	current, err := manager.Generation(t.Context(), "current-database-id")
+	require.NoError(t, err)
+	require.False(t, current.temporary)
+
+	assert.NoFileExists(t, stalePath)
+	assert.NoFileExists(t, stalePath+"-wal")
+	assert.NoFileExists(t, stalePath+"-shm")
+	assert.FileExists(t, usageCacheLeasePath(stalePath),
+		"lease inode stays stable for racing openers")
+	assert.FileExists(t, current.path)
+}
+
+func TestUsageCacheGenerationPreservesActivelyLeasedGeneration(t *testing.T) {
+	dir := t.TempDir()
+	archivePath := filepath.Join(dir, "sessions.db")
+	activeManager := newUsageCacheManager(archivePath)
+	active, err := activeManager.Generation(t.Context(), "active-database-id")
+	require.NoError(t, err)
+	require.False(t, active.temporary)
+
+	currentManager := newUsageCacheManager(archivePath)
+	current, err := currentManager.Generation(t.Context(), "current-database-id")
+	require.NoError(t, err)
+	require.False(t, current.temporary)
+	assert.FileExists(t, active.path,
+		"another process lease must fence retirement")
+
+	require.NoError(t, activeManager.Close())
+	require.NoError(t, currentManager.Close())
+
+	reaper := newUsageCacheManager(archivePath)
+	t.Cleanup(func() { require.NoError(t, reaper.Close()) })
+	_, err = reaper.Generation(t.Context(), "current-database-id")
+	require.NoError(t, err)
+	assert.NoFileExists(t, active.path,
+		"a later opener retires the generation after its lease drains")
+}
+
+func TestUsageCacheGenerationPreservesLegacyAndMismatchedCaches(t *testing.T) {
+	dir := t.TempDir()
+	archivePath := filepath.Join(dir, "sessions.db")
+	legacyPath := usageCacheGenerationPath(archivePath, 7, "legacy-database-id")
+	seedRecognizedUsageCache(t, legacyPath, 7, "legacy-database-id")
+
+	mismatchedPath := usageCacheGenerationPath(
+		archivePath, usageCacheFormatVersion, "filename-database-id")
+	seedRecognizedUsageCacheWithRetirementProtocol(
+		t, mismatchedPath, usageCacheFormatVersion, "metadata-database-id")
+	foreignPath := usageCacheGenerationPath(
+		archivePath, usageCacheFormatVersion, "foreign-database-id")
+	seedRecognizedUsageCacheWithRetirementProtocol(
+		t, foreignPath, usageCacheFormatVersion, "foreign-database-id")
+	foreign := openRawUsageCacheTestDB(t, foreignPath)
+	_, err := foreign.Exec(`PRAGMA application_id = 1234`)
+	require.NoError(t, err)
+	require.NoError(t, foreign.Close())
+
+	newerPath := usageCacheGenerationPath(
+		archivePath, usageCacheFormatVersion+1, "newer-database-id")
+	seedRecognizedUsageCacheWithRetirementProtocol(
+		t, newerPath, usageCacheFormatVersion+1, "newer-database-id")
+
+	manager := newUsageCacheManager(archivePath)
+	t.Cleanup(func() { require.NoError(t, manager.Close()) })
+	_, err = manager.Generation(t.Context(), "current-database-id")
+	require.NoError(t, err)
+
+	assert.FileExists(t, legacyPath,
+		"pre-protocol generations may be open in an older process")
+	assert.FileExists(t, newerPath,
+		"a downgraded binary must not force the newer format to rebuild")
+	assert.FileExists(t, mismatchedPath,
+		"retirement requires metadata to match the exact generation path")
+	assert.FileExists(t, foreignPath,
+		"a filename and protocol marker cannot replace application ownership")
+}
+
+func TestUsageCacheManagerClosePreservesCurrentGeneration(t *testing.T) {
+	archivePath := filepath.Join(t.TempDir(), "sessions.db")
+	manager := newUsageCacheManager(archivePath)
+	cache, err := manager.Generation(t.Context(), "database-id")
+	require.NoError(t, err)
+	require.NoError(t, manager.Close())
+
+	assert.FileExists(t, cache.path,
+		"normal shutdown preserves the warm current generation")
 }
 
 func TestUsageCacheTemporaryFallbackUsesSameSchema(t *testing.T) {
@@ -404,6 +514,8 @@ func TestUsageCacheReopenRetiresMismatchedGeneration(t *testing.T) {
 		t.Fatal("reopen left the mismatched usage fill coordinator running")
 	}
 	require.Error(t, original.db.Ping())
+	assert.NoFileExists(t, original.path,
+		"reopen retires the inactive old database-ID generation")
 	replacement, err := database.usageCache.Generation(t.Context(), replacementID)
 	require.NoError(t, err)
 	require.NotSame(t, original, replacement)
@@ -439,6 +551,7 @@ func TestUsageCacheRetirementWaitsForActiveGeneration(t *testing.T) {
 	release()
 	require.NoError(t, <-retired)
 	require.Error(t, cache.db.PingContext(t.Context()))
+	assert.NoFileExists(t, cache.path)
 	_, _, err = database.usageCache.acquireGeneration(t.Context(), databaseID)
 	require.ErrorIs(t, err, errUsageCacheSourceChanged)
 }
@@ -605,4 +718,17 @@ func seedRecognizedUsageCache(
 			`INSERT INTO usage_cache_metadata(key, value) VALUES (?, ?)`, key, value)
 		require.NoError(t, err)
 	}
+}
+
+func seedRecognizedUsageCacheWithRetirementProtocol(
+	t *testing.T, path string, format int, databaseID string,
+) {
+	t.Helper()
+	seedRecognizedUsageCache(t, path, format, databaseID)
+	conn := openRawUsageCacheTestDB(t, path)
+	defer conn.Close()
+	_, err := conn.Exec(
+		`INSERT INTO usage_cache_metadata(key, value) VALUES (?, ?)`,
+		usageCacheMetadataRetirementProtocol, "1")
+	require.NoError(t, err)
 }

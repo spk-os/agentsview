@@ -52,7 +52,7 @@ type VersionInfo struct {
 // Bump it when a client-visible contract cannot be decoded safely by an older
 // CLI or daemon.
 const (
-	APIVersion = 7
+	APIVersion = 8
 	// ScopedWatchPushAPIVersion is the first daemon API that accepts bounded
 	// watcher batches and their authoritative recovery scope on push requests.
 	ScopedWatchPushAPIVersion = 7
@@ -66,8 +66,12 @@ const daemonService = "agentsview"
 const (
 	defaultInsightLogDrainTimeout    = 2 * time.Second
 	defaultInsightLogStopWaitTimeout = 500 * time.Millisecond
+	defaultHTTPReadTimeout           = 10 * time.Second
 	corsAllowedRequestHeaders        = "Content-Type, Authorization, " +
-		service.SemanticSearchIntentHeader + ", " + rawSyncDeviceIDHeader
+		service.SemanticSearchIntentHeader + ", " + rawSyncDeviceIDHeader +
+		", " + rawSyncUploadOffsetHeader
+	corsExposedResponseHeaders = rawSyncUploadOffsetHeader + ", " +
+		rawSyncUploadLengthHeader + ", " + rawSyncUploadCompleteHeader + ", Location"
 )
 
 // Server is the HTTP server that serves the SPA and REST API.
@@ -102,6 +106,7 @@ type Server struct {
 
 	insightLogDrainTimeout    time.Duration
 	insightLogStopWaitTimeout time.Duration
+	httpReadTimeout           time.Duration
 
 	// handlerDelay is injected before each timeout-wrapped
 	// handler, used only by tests to guarantee handlers
@@ -168,10 +173,15 @@ type Server struct {
 	// with the worker-backed build-and-swap instead of an in-process resync.
 	localResyncRunner LocalResyncRunner
 
+	// localCompactRunner, when set, backs archive compaction with the daemon's
+	// maintenance barrier instead of allowing a CLI to bypass the writer.
+	localCompactRunner LocalCompactRunner
+
 	artifactExchangeRunner ArtifactExchangeRunner
 	rawSyncDeviceAuth      RawSyncDeviceAuth
 	rawSyncCustody         RawSyncCustody
 	rawSyncSchemaOnly      bool
+	rawSyncUploads         RawSyncUploads
 
 	ensurePricing func(context.Context, *db.DB) error
 }
@@ -232,6 +242,7 @@ func New(
 		httpRemoteCleanupRegistry: new(remotesync.CleanupRegistry),
 		insightLogDrainTimeout:    defaultInsightLogDrainTimeout,
 		insightLogStopWaitTimeout: defaultInsightLogStopWaitTimeout,
+		httpReadTimeout:           defaultHTTPReadTimeout,
 		ensurePricing:             pricingrefresh.EnsureCurrent,
 		spaFS:                     dist,
 		spaHandler:                http.FileServerFS(dist),
@@ -310,11 +321,40 @@ type RawSyncCustody interface {
 	) (rawsync.CommitResult, error)
 }
 
+// RawSyncUploads exposes authenticated resumable raw-object transfers.
+type RawSyncUploads interface {
+	Start(
+		context.Context,
+		rawsync.AuthIdentity,
+		parser.AgentType,
+		rawsync.ObjectRef,
+	) (rawsync.UploadSession, bool, error)
+	Status(
+		context.Context,
+		rawsync.AuthIdentity,
+		string,
+	) (rawsync.UploadSession, error)
+	Append(
+		context.Context,
+		rawsync.AuthIdentity,
+		string,
+		int64,
+		[]byte,
+	) (rawsync.UploadSession, error)
+}
+
 // WithRawSyncServices enables authenticated raw-sync machine routes.
 func WithRawSyncServices(auth RawSyncDeviceAuth, custody RawSyncCustody) Option {
 	return func(s *Server) {
 		s.rawSyncDeviceAuth = auth
 		s.rawSyncCustody = custody
+	}
+}
+
+// WithRawSyncUploads enables the scoped resumable raw-object data plane.
+func WithRawSyncUploads(uploads RawSyncUploads) Option {
+	return func(s *Server) {
+		s.rawSyncUploads = uploads
 	}
 }
 
@@ -516,6 +556,18 @@ func WithLocalResyncRunner(r LocalResyncRunner) Option {
 	return func(s *Server) { s.localResyncRunner = r }
 }
 
+// LocalCompactRunner runs staged maintenance against the local SQLite archive.
+// The daemon injects this runner so the command shares the archive-wide
+// maintenance barrier with sync and resync.
+type LocalCompactRunner func(
+	ctx context.Context, options db.CompactOptions,
+) (db.CompactResult, error)
+
+// WithLocalCompactRunner injects the daemon-managed compact runner.
+func WithLocalCompactRunner(r LocalCompactRunner) Option {
+	return func(s *Server) { s.localCompactRunner = r }
+}
+
 func (s *Server) humaConfig() huma.Config {
 	version := s.version.Version
 	if version == "" {
@@ -565,7 +617,7 @@ func (humaArbitraryJSON) Schema(huma.Registry) *huma.Schema {
 }
 
 func (s *Server) routes() {
-	configureHumaErrors()
+	configureHuma()
 	s.api = humago.New(s.mux, s.humaConfig())
 	s.registerTypedAPIRoutes()
 
@@ -1205,7 +1257,7 @@ func (s *Server) Serve(ln net.Listener) error {
 	srv := &http.Server{
 		Addr:        addr,
 		Handler:     s.Handler(),
-		ReadTimeout: 10 * time.Second,
+		ReadTimeout: s.httpReadTimeout,
 		IdleTimeout: 120 * time.Second,
 	}
 	if s.baseCtx != nil {
@@ -1383,12 +1435,13 @@ func corsMiddleware(
 				ensureVaryHeader(w.Header(), "Origin")
 				w.Header().Set(
 					"Access-Control-Allow-Methods",
-					"GET, POST, PUT, PATCH, DELETE, OPTIONS",
+					"GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
 				)
 				w.Header().Set(
 					"Access-Control-Allow-Headers",
 					corsAllowedRequestHeaders,
 				)
+				w.Header().Set("Access-Control-Expose-Headers", corsExposedResponseHeaders)
 				if r.Method == http.MethodOptions {
 					w.WriteHeader(http.StatusNoContent)
 					return
@@ -1420,12 +1473,13 @@ func corsMiddleware(
 			ensureVaryHeader(w.Header(), "Origin")
 			w.Header().Set(
 				"Access-Control-Allow-Methods",
-				"GET, POST, PUT, PATCH, DELETE, OPTIONS",
+				"GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
 			)
 			w.Header().Set(
 				"Access-Control-Allow-Headers",
 				corsAllowedRequestHeaders,
 			)
+			w.Header().Set("Access-Control-Expose-Headers", corsExposedResponseHeaders)
 			if r.Method == http.MethodOptions {
 				if !safeForReads {
 					http.Error(

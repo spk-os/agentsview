@@ -23,7 +23,7 @@ const (
 		COALESCE(timestamp, '') AS timestamp,
 		has_thinking, has_tool_use, content_length,
 		is_system,
-		model, token_usage, context_tokens, output_tokens,
+		model, token_usage, context_tokens, output_tokens, provider_id,
 		has_context_tokens, has_output_tokens,
 		claude_message_id, claude_request_id,
 		source_type, source_subtype, prompt_source, source_uuid,
@@ -33,7 +33,7 @@ const (
 		thinking_text,
 		timestamp, has_thinking, has_tool_use, content_length,
 		is_system,
-		model, token_usage, context_tokens, output_tokens,
+		model, token_usage, context_tokens, output_tokens, provider_id,
 		has_context_tokens, has_output_tokens,
 		claude_message_id, claude_request_id,
 		source_type, source_subtype, prompt_source, source_uuid,
@@ -51,7 +51,7 @@ const (
 	// Keep multi-row INSERT statements below SQLite's historic
 	// 999-variable limit so binaries built against older SQLite
 	// versions still work.
-	messageInsertRowsPerStmt         = 38 // 26 params per row
+	messageInsertRowsPerStmt         = 36 // 27 params per row
 	toolCallInsertRowsPerStmt        = 83 // 12 params per row (999/12 = 83)
 	toolResultEventInsertRowsPerStmt = 80 // 12 params per row
 )
@@ -109,6 +109,7 @@ type Message struct {
 	HasToolUse        bool           `json:"has_tool_use"`
 	ContentLength     int            `json:"content_length"`
 	Model             string         `json:"model"`
+	ProviderID        string         `json:"provider_id,omitempty"`
 	TokenUsage        jsontext.Value `json:"token_usage,omitempty"`
 	ContextTokens     int            `json:"context_tokens"`
 	OutputTokens      int            `json:"output_tokens"`
@@ -369,6 +370,33 @@ func (db *DB) GetAllMessages(
 	return msgs, nil
 }
 
+// ListMessageSourceUUIDs returns the non-empty source_uuid values of a
+// session's messages, in ordinal order. The sync engine uses it to verify
+// that a truncated shared-container reparse still contains every archived
+// message before letting it replace the stored transcript.
+func (db *DB) ListMessageSourceUUIDs(
+	ctx context.Context, sessionID string,
+) ([]string, error) {
+	rows, err := db.getReader().QueryContext(ctx, `
+		SELECT source_uuid
+		FROM messages
+		WHERE session_id = ? AND source_uuid != ''
+		ORDER BY ordinal ASC`, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("querying message source uuids: %w", err)
+	}
+	defer rows.Close()
+	var uuids []string
+	for rows.Next() {
+		var uuid string
+		if err := rows.Scan(&uuid); err != nil {
+			return nil, fmt.Errorf("scanning message source uuid: %w", err)
+		}
+		uuids = append(uuids, uuid)
+	}
+	return uuids, rows.Err()
+}
+
 func (db *DB) GetResumeModelCounts(
 	ctx context.Context, sessionID string,
 ) ([]ModelCount, error) {
@@ -437,7 +465,7 @@ type UnitOffset struct {
 // since != "" restricts the scan to sessions with ended_at >= since (RFC3339
 // or RFC3339Nano) for incremental refresh, comparing parsed timestamps
 // rather than raw strings via SQLite's datetime() so mixed fractional-second
-// precision doesn't produce a wrong ordering (see optionalSinceClause); ""
+// precision doesn't produce a wrong ordering (see sinceSessionScopeClause); ""
 // scans every session. includeAutomated=false additionally excludes
 // automated sessions (sessions.is_automated = 1) using the exact predicate
 // sessionFilterPredicates' ExcludeAutomated scope applies
@@ -462,32 +490,13 @@ func (db *DB) ScanEmbeddableUnits(
 	ctx context.Context, since string, includeAutomated bool,
 	fn func(EmbeddableUnit) error,
 ) (maxEnded string, err error) {
-	preds := []string{
-		"m.role IN ('user', 'assistant')",
-		"m.is_system = 0",
-		"s.deleted_at IS NULL",
-		SystemPrefixSQL("m.content", "m.role"),
-	}
-	if !includeAutomated {
-		preds = append(preds, automatedScopePredicate("human", "s.is_automated"))
-	}
-
-	query := `
-		SELECT m.session_id, m.role, m.source_uuid, m.ordinal, m.content,
-		       m.is_sidechain, s.relationship_type, s.parent_session_id,
-		       s.ended_at
-		FROM messages m
-		JOIN sessions s ON s.id = m.session_id
-		WHERE ` + strings.Join(preds, "\n\t\t  AND ") + `
-		` + optionalSinceClause(since) + `
-		ORDER BY m.session_id, m.ordinal`
-
 	args := []any{}
 	if since != "" {
 		args = append(args, since)
 	}
 
-	rows, err := db.getReader().QueryContext(ctx, query, args...)
+	rows, err := db.getReader().QueryContext(
+		ctx, embeddableUnitsQuery(since, includeAutomated), args...)
 	if err != nil {
 		return "", fmt.Errorf("scanning embeddable units: %w", err)
 	}
@@ -670,9 +679,49 @@ func runUnit(members []unitRow) EmbeddableUnit {
 	}
 }
 
-// optionalSinceClause returns the AND clause restricting the embeddable scan
-// to sessions with ended_at >= since (or ended_at IS NULL), or "" when since
-// is unset. It compares via SQLite's datetime() rather than raw string
+// embeddableUnitsQuery builds ScanEmbeddableUnits' statement. It takes one
+// bound argument (since) when since is set and none otherwise, and always
+// emits rows in (session_id, ordinal) order, which unitReducer depends on.
+func embeddableUnitsQuery(since string, includeAutomated bool) string {
+	preds := []string{
+		"m.role IN ('user', 'assistant')",
+		"m.is_system = 0",
+		"s.deleted_at IS NULL",
+		SystemPrefixSQL("m.content", "m.role"),
+	}
+	if !includeAutomated {
+		preds = append(preds, automatedScopePredicate("human", "s.is_automated"))
+	}
+	return `
+		SELECT m.session_id, m.role, m.source_uuid, m.ordinal, m.content,
+		       m.is_sidechain, s.relationship_type, s.parent_session_id,
+		       s.ended_at
+		FROM messages m
+		JOIN sessions s ON s.id = m.session_id
+		WHERE ` + strings.Join(preds, "\n\t\t  AND ") + `
+		` + sinceSessionScopeClause(since, includeAutomated) + `
+		ORDER BY m.session_id, m.ordinal`
+}
+
+// sinceSessionScopeClause returns the AND clause restricting the embeddable
+// scan to sessions with ended_at >= since (or ended_at IS NULL), or "" when
+// since is unset.
+//
+// The restriction is written as a session-id IN subquery rather than a
+// predicate on the joined sessions row so SQLite can drive the scan from
+// sessions, which is orders of magnitude smaller than messages. With the
+// predicate on the join, the planner had no indexed way to apply it and
+// scanned every message row (content included) through
+// idx_messages_session_ordinal before discarding almost all of them; an
+// incremental refresh touching eight sessions still read the whole corpus.
+// The IN form makes the candidate session list the outer loop and looks its
+// messages up with SEARCH ... (session_id=?) on that same index, which also
+// keeps the ORDER BY m.session_id, m.ordinal contract satisfied by the index
+// instead of a sort. The subquery repeats the caller's deleted_at and
+// automated-scope predicates so the candidate list stays as small as the
+// outer query's own filters allow.
+//
+// The since comparison uses SQLite's datetime() rather than raw string
 // ordering: RFC3339Nano's variable fractional-second precision (e.g.
 // ended_at values are sometimes stored with milliseconds, sometimes
 // without) makes lexicographic comparison wrong, since "...00.123Z" sorts
@@ -691,12 +740,19 @@ func runUnit(members []unitRow) EmbeddableUnit {
 // the same way via NULLIF(s.ended_at, ""): without it, "" is neither NULL
 // nor >= since, so a changed legacy session would never be rescanned again
 // once any watermark exists.
-func optionalSinceClause(since string) string {
+func sinceSessionScopeClause(since string, includeAutomated bool) string {
 	if since == "" {
 		return ""
 	}
-	return "AND (NULLIF(s.ended_at, '') IS NULL OR " +
-		"datetime(NULLIF(s.ended_at, '')) >= datetime(?))"
+	preds := []string{"es.deleted_at IS NULL"}
+	if !includeAutomated {
+		preds = append(preds, automatedScopePredicate("human", "es.is_automated"))
+	}
+	preds = append(preds, "(NULLIF(es.ended_at, '') IS NULL OR "+
+		"datetime(NULLIF(es.ended_at, '')) >= datetime(?))")
+	return `AND m.session_id IN (
+			SELECT es.id FROM sessions es
+			 WHERE ` + strings.Join(preds, "\n\t\t\t   AND ") + `)`
 }
 
 // endedAfter reports whether candidate is chronologically after current,
@@ -740,7 +796,7 @@ func insertMessagesTx(
 	for start := 0; start < len(msgs); start += messageInsertRowsPerStmt {
 		end := min(start+messageInsertRowsPerStmt, len(msgs))
 		batch := msgs[start:end]
-		args := make([]any, 0, len(batch)*26)
+		args := make([]any, 0, len(batch)*27)
 		for i, m := range batch {
 			id := nextID + int64(start+i)
 			ids[start+i] = id
@@ -750,7 +806,7 @@ func insertMessagesTx(
 		query := fmt.Sprintf(
 			"INSERT INTO messages (id, %s) VALUES %s",
 			insertMessageCols,
-			multiRowPlaceholders(len(batch), 26),
+			multiRowPlaceholders(len(batch), 27),
 		)
 		if _, err := tx.Exec(query, args...); err != nil {
 			first := batch[0].Ordinal
@@ -1867,6 +1923,9 @@ func attachToolCallsWithQuerier(
 	if err := attachToolResultEvents(ctx, q, msgs); err != nil {
 		return err
 	}
+	// A summary that only repeated its single event is not stored. Refill it
+	// here, once, so no consumer of a loaded message has to know that.
+	RestoreMessageResultContent(msgs)
 	return nil
 }
 
@@ -2071,6 +2130,7 @@ func scanMessages(rows *sql.Rows) ([]Message, error) {
 			&m.IsSystem,
 			&m.Model, &tokenUsage,
 			&m.ContextTokens, &m.OutputTokens,
+			&m.ProviderID,
 			&m.HasContextTokens, &m.HasOutputTokens,
 			&m.ClaudeMessageID, &m.ClaudeRequestID,
 			&m.SourceType, &m.SourceSubtype, &m.PromptSource, &m.SourceUUID,
@@ -2079,9 +2139,7 @@ func scanMessages(rows *sql.Rows) ([]Message, error) {
 		if err != nil {
 			return nil, fmt.Errorf("scanning message: %w", err)
 		}
-		if tokenUsage != "" {
-			m.TokenUsage = jsontext.Value(tokenUsage)
-		}
+		m.TokenUsage = DecodeStoredTokenUsage(tokenUsage)
 		msgs = append(msgs, m)
 	}
 	return msgs, rows.Err()
@@ -2162,7 +2220,7 @@ func isStrippableControl(r rune) bool {
 // metadata-only changes invalidate the fast path.
 func (db *DB) MessageTokenFingerprint(sessionID string) (string, error) {
 	rows, err := db.getReader().Query(
-		`SELECT ordinal, model, token_usage, context_tokens,
+		`SELECT ordinal, model, provider_id, token_usage, context_tokens,
 			output_tokens, has_context_tokens, has_output_tokens,
 			claude_message_id, claude_request_id,
 			source_type, source_subtype, prompt_source, source_uuid,
@@ -2181,7 +2239,7 @@ func (db *DB) MessageTokenFingerprint(sessionID string) (string, error) {
 	for rows.Next() {
 		var r tokenFingerprintRow
 		if err := rows.Scan(
-			&r.ordinal, &r.model, &r.tokenUsage, &r.contextTokens,
+			&r.ordinal, &r.model, &r.providerID, &r.tokenUsage, &r.contextTokens,
 			&r.outputTokens, &r.hasContextTokens, &r.hasOutputTokens,
 			&r.claudeMessageID, &r.claudeRequestID,
 			&r.sourceType, &r.sourceSubtype, &r.promptSource, &r.sourceUUID,
@@ -2429,22 +2487,55 @@ func (db *DB) SetToolCallSubagentSession(
 	return nil
 }
 
+// soleToolResultEventTx returns a one-element slice when the call
+// identified by (session, owning message ordinal, call index) has exactly
+// one stored result event, and nil for every other count, which never
+// dedups. The key is the same triple attachToolResultEvents and
+// ToolCallResultContentSQL use, so every site agrees on which event a
+// summary is compared against. MIN over the single row is its content.
+func soleToolResultEventTx(
+	tx *sql.Tx, sessionID string, messageOrdinal, callIndex int,
+) ([]ToolResultEvent, error) {
+	var count int
+	var content sql.NullString
+	if err := tx.QueryRow(
+		`SELECT COUNT(*), MIN(content) FROM tool_result_events
+		 WHERE session_id = ?
+		   AND tool_call_message_ordinal = ?
+		   AND call_index = ?`,
+		sessionID, messageOrdinal, callIndex,
+	).Scan(&count, &content); err != nil {
+		return nil, fmt.Errorf(
+			"counting tool result events for %s/%d/%d: %w",
+			sessionID, messageOrdinal, callIndex, err,
+		)
+	}
+	if count != 1 {
+		return nil, nil
+	}
+	return []ToolResultEvent{{Content: content.String}}, nil
+}
+
 func applyToolCallSubagentLinkTx(
 	tx *sql.Tx, sessionID string, link ToolCallSubagentLink,
 	blockedResultCategories map[string]bool,
 ) (bool, error) {
 	var toolName, category, currentSubagent, currentResultContent string
-	var currentResultContentLen int
+	var currentResultContentLen, messageOrdinal, callIndex int
 	if err := tx.QueryRow(
-		`SELECT tool_name, category, COALESCE(subagent_session_id, ''),
-		        COALESCE(result_content_length, 0),
-		        COALESCE(result_content, '')
-		 FROM tool_calls
-		 WHERE session_id = ? AND tool_use_id = ?`,
+		`SELECT tc.tool_name, tc.category,
+		        COALESCE(tc.subagent_session_id, ''),
+		        COALESCE(tc.result_content_length, 0),
+		        COALESCE(tc.result_content, ''),
+		        m.ordinal, COALESCE(tc.call_index, 0)
+		 FROM tool_calls tc
+		 JOIN messages m ON m.id = tc.message_id
+		 WHERE tc.session_id = ? AND tc.tool_use_id = ?`,
 		sessionID, link.ToolUseID,
 	).Scan(
 		&toolName, &category, &currentSubagent,
 		&currentResultContentLen, &currentResultContent,
+		&messageOrdinal, &callIndex,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
@@ -2472,11 +2563,25 @@ func applyToolCallSubagentLinkTx(
 		return err == nil, err
 	}
 	resultContent := link.ResultContent
+	resultContentLen := ResolveResultContentLength(
+		resultContent, link.ResultContentLen,
+	)
 	if blockedResultCategories[category] {
 		resultContent = ""
+	} else {
+		// A linked result carries no events of its own, but the call it
+		// targets may already have one stored. Re-storing a summary the
+		// event repeats would undo the dedup on every incremental pass.
+		sole, err := soleToolResultEventTx(
+			tx, sessionID, messageOrdinal, callIndex,
+		)
+		if err != nil {
+			return false, err
+		}
+		resultContent = DedupToolCallResultSummary(resultContent, sole)
 	}
 	if currentSubagent == storedSubagent &&
-		currentResultContentLen == link.ResultContentLen &&
+		currentResultContentLen == resultContentLen &&
 		currentResultContent == resultContent {
 		return false, nil
 	}
@@ -2485,7 +2590,7 @@ func applyToolCallSubagentLinkTx(
 		 SET subagent_session_id = ?, result_content_length = ?,
 		     result_content = ?
 		 WHERE session_id = ? AND tool_use_id = ?`,
-		nilIfEmpty(currentSubagent), link.ResultContentLen, resultContent,
+		nilIfEmpty(currentSubagent), resultContentLen, resultContent,
 		sessionID, link.ToolUseID,
 	)
 	return err == nil, err
@@ -2625,6 +2730,7 @@ func (db *DB) GetMessageByOrdinal(
 		&m.IsSystem,
 		&m.Model, &tokenUsage,
 		&m.ContextTokens, &m.OutputTokens,
+		&m.ProviderID,
 		&m.HasContextTokens, &m.HasOutputTokens,
 		&m.ClaudeMessageID, &m.ClaudeRequestID,
 		&m.SourceType, &m.SourceSubtype, &m.PromptSource, &m.SourceUUID,
@@ -2636,9 +2742,7 @@ func (db *DB) GetMessageByOrdinal(
 	if err != nil {
 		return nil, err
 	}
-	if tokenUsage != "" {
-		m.TokenUsage = jsontext.Value(tokenUsage)
-	}
+	m.TokenUsage = DecodeStoredTokenUsage(tokenUsage)
 	return &m, nil
 }
 
@@ -2660,22 +2764,40 @@ func resolveToolCalls(
 	for i, m := range msgs {
 		for callIdx, tc := range m.ToolCalls {
 			calls = append(calls, ToolCall{
-				MessageID:           ids[i],
-				SessionID:           m.SessionID,
-				ToolName:            tc.ToolName,
-				Category:            tc.Category,
-				ToolUseID:           tc.ToolUseID,
-				InputJSON:           tc.InputJSON,
-				SkillName:           tc.SkillName,
-				ResultContentLength: tc.ResultContentLength,
-				ResultContent:       tc.ResultContent,
-				SubagentSessionID:   tc.SubagentSessionID,
-				FilePath:            tc.FilePath,
-				CallIndex:           callIdx,
+				MessageID: ids[i],
+				SessionID: m.SessionID,
+				ToolName:  tc.ToolName,
+				Category:  tc.Category,
+				ToolUseID: tc.ToolUseID,
+				InputJSON: tc.InputJSON,
+				SkillName: tc.SkillName,
+				ResultContentLength: ResolveResultContentLength(
+					tc.ResultContent, tc.ResultContentLength,
+				),
+				ResultContent: DedupToolCallResultSummary(
+					tc.ResultContent, tc.ResultEvents,
+				),
+				SubagentSessionID: tc.SubagentSessionID,
+				FilePath:          tc.FilePath,
+				CallIndex:         callIdx,
 			})
 		}
 	}
 	return calls
+}
+
+// ResolveResultContentLength returns the length to store for a tool-result
+// summary. Non-empty text is measured; a supplied length is kept only when
+// the text is empty, which is the withheld (blocked category) and deduped
+// (single event holds the text) cases where the length records how large
+// the summary was. The same rule applies to result events. It holds by
+// construction at every write path, so a caller can neither omit the length
+// nor store one that disagrees with the text.
+func ResolveResultContentLength(text string, supplied int) int {
+	if text != "" {
+		return len(text)
+	}
+	return supplied
 }
 
 type toolResultEventRow struct {
@@ -2691,9 +2813,9 @@ func resolveToolResultEvents(msgs []Message) []toolResultEventRow {
 		for callIndex, tc := range m.ToolCalls {
 			for eventIndex, ev := range tc.ResultEvents {
 				ev.EventIndex = eventIndex
-				if ev.ContentLength == 0 {
-					ev.ContentLength = len(ev.Content)
-				}
+				ev.ContentLength = ResolveResultContentLength(
+					ev.Content, ev.ContentLength,
+				)
 				if ev.ToolUseID == "" {
 					ev.ToolUseID = tc.ToolUseID
 				}
@@ -2710,4 +2832,42 @@ func resolveToolResultEvents(msgs []Message) []toolResultEventRow {
 		}
 	}
 	return rows
+}
+
+// DecodeStoredTokenUsage converts a stored token_usage column into a
+// jsontext.Value: "" and anything that is not valid JSON both yield nil.
+//
+// token_usage is "TEXT NOT NULL DEFAULT ”", so nearly every row holds "".
+// Returning a NON-NIL, ZERO-LENGTH jsontext.Value for those rows is what
+// made every duckdb serve transcript blank: a zero-length value is not
+// valid JSON, omitempty does not skip it, and jsontext.Value defers parsing
+// to marshal time, so the failure surfaced only when the API encoded the
+// response. internal/server installs no recover(), so it became an
+// unrecovered handler panic that dropped the connection
+// (ERR_EMPTY_RESPONSE) on GET /api/v1/sessions/{id}/messages, while the
+// HTML export of the same session still rendered because it never marshals
+// this field.
+//
+// Dropping values that are non-empty but invalid is belt-and-braces rather
+// than a fix for an observed failure: every parser produces valid usage by
+// construction (claude.go extracts from a line already checked with
+// gjson.ValidBytes; devin.go builds it with json.Marshal). There is
+// deliberately no write-time validation -- this is the only place stored
+// token_usage is checked -- so the guard sits where the consequence is,
+// since reaching the encoder with an invalid value panics the handler.
+// Clearing only the unusable metadata keeps the rest of the message intact.
+//
+// Exported because every backend that serves messages needs the identical
+// guard and must not drift: pg serve and duckdb serve reach the same
+// response encoder. See internal/postgres/messages.go and
+// internal/duckdb/messages.go.
+func DecodeStoredTokenUsage(raw string) jsontext.Value {
+	if raw == "" {
+		return nil
+	}
+	v := jsontext.Value(raw)
+	if !v.IsValid() {
+		return nil
+	}
+	return v
 }

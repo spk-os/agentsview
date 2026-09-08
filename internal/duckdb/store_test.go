@@ -310,13 +310,6 @@ func TestStoreListTrashedSessionsOrdersNewestFirstAndCapsAt500(t *testing.T) {
 			TIMESTAMP '2026-01-01 00:00:00' + INTERVAL (i) SECOND
 		FROM range(600) t(i)`)
 	require.NoError(t, err)
-	// A recoverable source-missing tombstone newer than all user trash: if
-	// deletion_cause filtering regressed it would surface as the first row.
-	_, err = duck.ExecContext(ctx, `
-		INSERT INTO sessions (id, project, deleted_at, deletion_cause)
-		VALUES ('tombstone', 'trash-parity',
-			TIMESTAMP '2026-02-01 00:00:00', 'source_missing')`)
-	require.NoError(t, err)
 	_, err = duck.ExecContext(ctx,
 		`INSERT INTO sessions (id, project) VALUES ('active', 'trash-parity')`)
 	require.NoError(t, err)
@@ -324,7 +317,7 @@ func TestStoreListTrashedSessionsOrdersNewestFirstAndCapsAt500(t *testing.T) {
 	trashed, err := store.ListTrashedSessions(ctx)
 	require.NoError(t, err)
 	// Same cap and ordering as the SQLite and PG stores: newest 500 by
-	// deleted_at, excluding active rows and source-missing tombstones.
+	// deleted_at, excluding active rows.
 	require.Len(t, trashed, 500)
 	assert.Equal(t, "trash-599", trashed[0].ID)
 	assert.Equal(t, "trash-100", trashed[499].ID)
@@ -395,6 +388,16 @@ func TestStoreSearchesMessagesContentAndSecrets(t *testing.T) {
 	require.Len(t, content.Matches, 1)
 	assert.Equal(t, "tool_result", content.Matches[0].Location)
 	assert.Equal(t, fixture.alphaID, content.Matches[0].SessionID)
+
+	excluded, err := store.SearchContent(ctx, db.ContentSearchFilter{
+		Pattern:           "duck result",
+		Sources:           []string{"tool_result"},
+		IncludeOneShot:    true,
+		ExcludeSessionIDs: []string{fixture.alphaID},
+		Limit:             10,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, excluded.Matches)
 
 	findings, err := store.ListSecretFindings(ctx, db.SecretFindingFilter{
 		Project: "alpha",
@@ -3169,7 +3172,7 @@ func TestDuckDBDailyUsageKeepsAuthoritativeCostSessionScoped(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
 	require.NoError(t, local.UpsertModelPricing([]db.ModelPricing{{
-		ModelPattern:  "claude-sonnet-4-6",
+		ModelPattern:  "authoritative-cost-model",
 		InputPerMTok:  money.MustParseDollars("10"),
 		OutputPerMTok: money.MustParseDollars("20"),
 	}}))
@@ -3188,7 +3191,7 @@ func TestDuckDBDailyUsageKeepsAuthoritativeCostSessionScoped(t *testing.T) {
 		{
 			Session: authoritative,
 			UsageEvents: []db.UsageEvent{{
-				Source: "shutdown", Model: "claude-sonnet-4-6",
+				Source: "shutdown", Model: "authoritative-cost-model",
 				InputTokens: 1000, OutputTokens: 500,
 				Cost: &reportedCost, CostStatus: "exact",
 				CostSource: db.CopilotReportedCostSource,
@@ -3200,7 +3203,7 @@ func TestDuckDBDailyUsageKeepsAuthoritativeCostSessionScoped(t *testing.T) {
 		{
 			Session: estimated,
 			UsageEvents: []db.UsageEvent{{
-				Source: "shutdown", Model: "claude-sonnet-4-6",
+				Source: "shutdown", Model: "authoritative-cost-model",
 				InputTokens: 1000, OutputTokens: 500,
 				OccurredAt: "2026-01-18T01:01:00.000Z",
 				DedupKey:   "estimated",
@@ -3469,7 +3472,7 @@ func TestDailyUsageCostsMessageReasoningTokens(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
 	require.NoError(t, local.UpsertModelPricing([]db.ModelPricing{{
-		ModelPattern:  "gpt-5.4",
+		ModelPattern:  "reasoning-model",
 		InputPerMTok:  money.MustParseDollars("1"),
 		OutputPerMTok: money.MustParseDollars("2"),
 	}}))
@@ -3477,7 +3480,7 @@ func TestDailyUsageCostsMessageReasoningTokens(t *testing.T) {
 	msg := syncMessage(
 		"duck-message-reasoning", 0, "assistant", "message reasoning",
 		"2026-01-19T00:01:00.000Z")
-	msg.Model = "gpt-5.4"
+	msg.Model = "reasoning-model"
 	msg.TokenUsage = jsontext.Value(
 		`{"input_tokens":1000,"output_tokens":0,"reasoning_tokens":500}`)
 	_, err := local.WriteSessionBatchAtomic([]db.SessionBatchWrite{{
@@ -4421,4 +4424,54 @@ func TestDuckDBBranchDimension(t *testing.T) {
 		total += day.InputTokens
 	}
 	assert.Equal(t, 100, total, "branch filter restricts usage to alpha/main")
+}
+
+func TestSearch_DateRange(t *testing.T) {
+	fixtures := []struct{ id, start, end string }{
+		{"early", "2024-06-01T10:00:00Z", "2024-06-01T11:00:00Z"},
+		{"boundary", "2024-06-02T23:59:59Z", "2024-06-02T23:59:59Z"},
+		{"late", "2024-06-03T00:00:00Z", "2024-06-03T01:00:00Z"},
+		{"spanning", "2024-06-01T23:00:00Z", "2024-06-03T01:00:00Z"},
+	}
+	var writes []db.SessionBatchWrite
+	for _, f := range fixtures {
+		sess := syncSession(f.id, "project-a", "seed", f.start, 1)
+		sess.EndedAt = new(f.end)
+		sess.SessionName = new("datefilter name")
+		writes = append(writes, db.SessionBatchWrite{
+			Session:     sess,
+			Messages:    []db.Message{syncMessage(f.id, 0, "user", "datefilter message", f.start)},
+			DataVersion: 1, ReplaceMessages: true,
+		})
+	}
+	store := newUnitsStore(t, writes)
+	for _, tc := range []struct {
+		name, from, to string
+		want           []string
+	}{
+		{"omitted", "", "", []string{"early", "boundary", "late", "spanning"}},
+		{"lower only", "2024-06-02", "", []string{"boundary", "late", "spanning"}},
+		{"upper only", "", "2024-06-02", []string{"early", "boundary", "spanning"}},
+		{"same day", "2024-06-02", "2024-06-02", []string{"boundary", "spanning"}},
+		{"no matches", "2024-06-04", "2024-06-04", []string{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, query := range []string{"message", "name"} {
+				filter := db.SearchFilter{Query: query, Project: "project-a", DateFrom: tc.from, DateTo: tc.to, Limit: 1}
+				var ids []string
+				for range len(fixtures) + 1 {
+					out, err := store.Search(context.Background(), filter)
+					require.NoError(t, err)
+					for _, hit := range out.Results {
+						ids = append(ids, hit.SessionID)
+					}
+					if out.NextCursor == 0 {
+						break
+					}
+					filter.Cursor = out.NextCursor
+				}
+				assert.ElementsMatch(t, tc.want, ids, "query %s", query)
+			}
+		})
+	}
 }

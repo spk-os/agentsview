@@ -1,54 +1,78 @@
 ---
 title: Hosted Raw Sync
-description: Architecture, security boundaries, and delivery status for raw-first hosted sync
+description: Keep original session files in hosted custody with authenticated, resumable uploads
 ---
 
-Hosted raw sync is the planned, in-development path for sending original agent
-source artifacts to a hosted AgentsView service. The server will keep the
-authoritative raw generation, then derive PostgreSQL sessions and embeddings
-from it.
+Hosted raw sync keeps original agent session files from one or more machines in
+hosted custody. Each laptop captures supported local sources, authenticates as a
+provisioned device, resumes interrupted uploads, and remembers durable progress
+across restarts. `agentsview raw-sync watch` keeps the hosted copy current.
 
 ```mermaid
 flowchart LR
     Watcher["Laptop watcher"] -->|"authenticated raw upload"| Custody["Immutable raw custody"]
-    Custody --> Parser["Server parsing"]
+    Custody -. "future" .-> Parser["Server parsing"]
     Parser --> PostgreSQL["PostgreSQL projection"]
     PostgreSQL --> Embeddings["Server embeddings"]
 ```
 
-This moves long-running parsing and embedding work off laptops and gives the
-server enough source material to reparse after parser fixes or rebuild derived
-data after loss.
+The raw archive gives an operator the source material needed to rebuild derived
+data. Version 0.42.0 ships capture and upload; it does not yet parse accepted
+generations into hosted sessions or build server-owned embeddings.
 
-!!! warning "Not available for use yet"
+!!! note "You need provisioned device credentials"
 
-    AgentsView now exposes part of the authenticated raw-sync control plane from
-    `agentsview pg serve`, but it does not yet expose device enrollment, object
-    upload, or status endpoints. There is also no laptop uploader, server-side
-    parsing worker, or server-owned embedding pipeline. No supported command or
-    configuration setting enables hosted raw sync end to end.
+    The laptop command is ready to use once the hosted deployment operator gives you
+    a server URL, device ID, and device credential. Device enrollment and revocation
+    are operator-managed; AgentsView does not yet provide a public enrollment
+    command or HTTP endpoint.
 
-    The existing [`agentsview pg push`](/pg-sync/) workflow remains supported and
-    unchanged. It parses sessions locally and can build embeddings locally before
-    pushing derived rows and vectors to PostgreSQL.
+    Use [`agentsview pg push`](/docs/pg-sync/) when the shared server must provide
+    browsable sessions today. It parses sessions locally and can build embeddings
+    locally before pushing derived rows and vectors to PostgreSQL.
 
 The tracked delivery sequence and production acceptance criteria live in
 [GitHub issue #1352](https://github.com/kenn-io/agentsview/issues/1352).
 
 ## Delivery status
 
-| Layer                  | Status                                                                                       | Current boundary                                                                                                            |
-| ---------------------- | -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| Raw custody            | Foundation implemented in [#1396](https://github.com/kenn-io/agentsview/pull/1396)           | Validated objects, canonical manifests, durable receipts, source-head fencing, and parse-job creation                       |
-| Device authentication  | Foundation implemented in [#1459](https://github.com/kenn-io/agentsview/pull/1459)           | One-time device credentials, scoped short-lived tokens, server-derived identity, and revocation                             |
-| HTTP raw transport     | Control plane partly implemented in [#1473](https://github.com/kenn-io/agentsview/pull/1473) | Credential exchange, missing-object negotiation, and manifest commit; enrollment, object upload, and status remain          |
-| Laptop capture         | Not implemented                                                                              | Provider watching, append fast paths, SQLite snapshots, spooling, checkpoints, and reconciliation remain future client work |
-| Server derivation      | Not implemented                                                                              | Manifest materialization, parsing, transactional PostgreSQL projection, and embeddings are not running                      |
-| Operations and cutover | Not implemented                                                                              | Retention, garbage collection, disaster rebuilds, rollout controls, and migration from `pg push` remain future work         |
+| Layer                  | Status        | Current boundary                                                                                                             |
+| ---------------------- | ------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| Raw custody            | Available     | Validated objects, canonical manifests, durable receipts, source-head fencing, and parse-job creation                        |
+| Device authentication  | Available     | Credential exchange, scoped short-lived tokens, server-derived identity, and revocation; enrollment remains operator-managed |
+| HTTP raw transport     | Available     | Missing-object negotiation, resumable upload, and manifest commit; status is local only                                      |
+| Laptop capture         | Available     | Watching, bounded audits, safe SQLite snapshots, durable spooling, checkpoints, retries, and local status                    |
+| Server derivation      | Not available | Accepted generations are not yet parsed into PostgreSQL sessions or embeddings                                               |
+| Operations and cutover | Not available | Retention, garbage collection, disaster rebuilds, and migration from `pg push` remain future work                            |
 
-The broader “device enrollment and authenticated raw transport” delivery item in
-#1352 remains incomplete because there is no supported way to enroll a device or
-upload the objects that a manifest references.
+The broader delivery issue remains open because public enrollment, hosted
+session derivation, and production lifecycle controls are not finished.
+
+## Laptop raw watch daemon
+
+`agentsview raw-sync watch` watches supported local provider roots, captures
+their original files, and uploads durable generations. It does not parse
+sessions or write the normal local SQLite archive. S3 roots are excluded.
+
+The server URL and device ID may be flags or environment variables. The device
+credential is environment-only so it does not appear in process arguments:
+
+```bash
+export AGENTSVIEW_RAW_SYNC_URL=https://agents.example.com
+export AGENTSVIEW_RAW_SYNC_DEVICE_ID=device-id
+export AGENTSVIEW_RAW_SYNC_CREDENTIAL=device-credential
+agentsview raw-sync watch
+```
+
+The command performs an initial bounded audit, watches for changes, repeats the
+audit every 15 minutes by default, and retries uploads every minute. Captures
+and upload state are kept under `raw-sync/` in the configured AgentsView data
+directory. `agentsview raw-sync status` prints path-free JSON describing the
+local checkpoint, pending work, retry time, failures, and coverage.
+
+The normal writable `agentsview serve` daemon has its own parser watcher. Run
+both only when local parsed sessions and hosted raw custody are both required;
+doing so intentionally creates two watchers over the same provider roots.
 
 ## HTTP control plane
 
@@ -63,19 +87,21 @@ The implemented routes are:
 | --------------------------------------- | --------------------------------------- | --------------------------------------- |
 | `POST /api/v1/raw-sync/tokens`          | Device credential and device ID         | Issue a 15-minute scoped access token   |
 | `POST /api/v1/raw-sync/objects/missing` | Access token with the `negotiate` scope | Return object references not in custody |
+| `POST /api/v1/raw-sync/uploads`         | Access token with the `upload` scope    | Start or resume an object upload        |
+| `HEAD /api/v1/raw-sync/uploads/{id}`    | Access token with the `upload` scope    | Read the accepted upload offset         |
+| `PATCH /api/v1/raw-sync/uploads/{id}`   | Access token with the `upload` scope    | Append and finalize object bytes        |
 | `POST /api/v1/raw-sync/manifests`       | Access token with the `commit` scope    | Validate and commit one raw generation  |
 
 These machine routes use their own device credentials and scoped tokens. They do
 not accept the shared bearer token that can protect the rest of a remote
 AgentsView server. The token endpoint accepts the fixed `negotiate`, `upload`,
-`commit`, and `status` scope names, although this branch exposes handlers only
-for negotiation and commit.
+`commit`, and `status` scope names. There is not yet a remote status handler;
+the current status command reads the laptop checkpoint.
 
 PostgreSQL stores device, token, manifest, receipt, source-head, and parse-job
 metadata. The raw object repository is opened lazily under `raw-sync/` in the
-configured AgentsView data directory. Because the HTTP surface cannot yet upload
-missing objects, it is a server foundation for the future laptop client, not a
-complete protocol for integrations.
+configured AgentsView data directory. The HTTP surface is still an internal
+protocol for the AgentsView laptop client, not a supported integration API.
 
 ## Raw custody contract
 
@@ -146,7 +172,7 @@ worker scratch space, plus access controls around device enrollment and
 revocation. PostgreSQL row-level security remains a planned defense-in-depth
 layer; the current foundation does not configure it.
 
-Do not build integrations against the partial HTTP routes, internal Go packages,
-or raw PostgreSQL tables yet. The complete public protocol, operator controls,
-compatibility policy, and recovery tooling will be documented when those entry
-points exist.
+Treat the HTTP routes as the protocol between the bundled laptop client and a
+hosted AgentsView deployment, not as a general integration API. Public operator
+controls, compatibility policy, and recovery tooling will be documented when
+those entry points exist.

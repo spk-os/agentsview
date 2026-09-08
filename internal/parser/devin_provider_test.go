@@ -124,7 +124,7 @@ func TestDevinProviderDBEventsFanOutAndPreserveTombstones(t *testing.T) {
 	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{root}})
 	require.True(t, ok)
 
-	for _, changedPath := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+	for _, changedPath := range []string{dbPath, dbPath + "-wal"} {
 		changed, err := provider.SourcesForChangedPath(context.Background(), ChangedPathRequest{
 			Path:              changedPath,
 			EventKind:         "write",
@@ -187,6 +187,12 @@ func TestDevinProviderRejectsUnrelatedChangedPaths(t *testing.T) {
 	for _, req := range []ChangedPathRequest{
 		{
 			Path:      filepath.Join(root, "cli", "sessions.db-backup"),
+			EventKind: "write",
+			WatchRoot: filepath.Join(root, "cli"),
+		},
+		{
+			// The provider's own read connection rewrites the -shm index.
+			Path:      filepath.Join(root, "cli", devinDBFilename+"-shm"),
 			EventKind: "write",
 			WatchRoot: filepath.Join(root, "cli"),
 		},
@@ -411,6 +417,42 @@ func TestDevinProviderFingerprintWithoutTranscriptChangesWhenMessageNodesChange(
 
 	execDevinTestSQL(t, fixture.DBPath, `UPDATE message_nodes SET chat_message = '{"role":"user","content":"omega"}' WHERE session_id = 'session-message-node-change'`)
 
+	after, err := provider.Fingerprint(context.Background(), source)
+	require.NoError(t, err)
+
+	assert.Equal(t, before.Key, after.Key)
+	assert.NotEqual(t, before.Hash, after.Hash)
+}
+
+func TestDevinProviderFingerprintWithoutTranscriptChangesWhenMainChainChanges(t *testing.T) {
+	const sessionID = "session-main-chain-change"
+	fixture := newDevinTestFixture(t,
+		devinSessionRow{
+			ID:               sessionID,
+			Title:            "DB messages",
+			WorkingDirectory: "/tmp/app",
+			Model:            "db-model",
+			CreatedAt:        new(int64(1704103200)),
+			LastActivityAt:   new(int64(1704103209)),
+			MainChainID:      new(int64(2)),
+		},
+	)
+	fixture.insertMessageNodes(t,
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"role":"user","content":"question"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 2, ParentNodeID: new(int64(1)), ChatMessage: `{"role":"assistant","content":"first branch"}`, CreatedAt: 1704103205},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 3, ParentNodeID: new(int64(1)), ChatMessage: `{"role":"assistant","content":"second branch"}`, CreatedAt: 1704103205},
+	)
+
+	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{fixture.Root}})
+	require.True(t, ok)
+	source, ok, err := provider.FindSource(context.Background(), FindSourceRequest{RawSessionID: sessionID})
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	before, err := provider.Fingerprint(context.Background(), source)
+	require.NoError(t, err)
+	execDevinTestSQL(t, fixture.DBPath,
+		`UPDATE sessions SET main_chain_id = 3 WHERE id = 'session-main-chain-change'`)
 	after, err := provider.Fingerprint(context.Background(), source)
 	require.NoError(t, err)
 

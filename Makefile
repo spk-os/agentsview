@@ -36,7 +36,7 @@ AIR_BIN := $(shell if command -v air >/dev/null 2>&1; then command -v air; \
 	elif [ -x "$(GOPATH_FIRST)/bin/air" ]; then printf "%s" "$(GOPATH_FIRST)/bin/air"; \
 	fi)
 
-.PHONY: build build-release install frontend frontend-dev dev check-air air-install desktop-dev desktop-build desktop-macos-app desktop-macos-dmg desktop-windows-installer desktop-linux-appimage desktop-app docs-install docs-build docs-serve docs-check docs-screenshots docs-assets-branch docs-generated-assets-branch docs-deploy-staging docs-deploy test test-short test-evalingest bench-backends bench-gate bench-gate-config test-postgres test-postgres-ci test-s3 postgres-up postgres-down test-ssh test-ssh-ci ssh-up ssh-down e2e e2e-duckdb vet lint lint-ci lint-golangci lint-golangci-ci nilaway nilaway-golangci-build lint-tools tidy clean release release-darwin-arm64 release-darwin-amd64 release-linux-amd64 install-hooks ensure-embed-dir pricing-snapshot sqlite-vec-header dev-snapshot help
+.PHONY: build build-release install frontend frontend-dev dev check-air air-install desktop-dev desktop-build desktop-macos-app desktop-macos-dmg desktop-windows-installer desktop-linux-appimage desktop-app docs-install docs-build docs-serve docs-check docs-screenshots docs-assets-branch docs-generated-assets-branch docs-deploy-staging docs-deploy test test-short test-evalingest bench-backends bench-gate bench-gate-config bench-pg-usage test-postgres test-postgres-ci test-s3 postgres-up postgres-down test-ssh test-ssh-ci ssh-up ssh-down e2e e2e-duckdb vet lint lint-ci lint-golangci lint-golangci-ci nilaway nilaway-golangci-build lint-tools tidy clean release release-darwin-arm64 release-darwin-amd64 release-linux-amd64 install-hooks ensure-embed-dir pricing-snapshot sqlite-vec-header dev-snapshot help
 
 # Ensure go:embed has at least one file (no-op if frontend is built)
 ensure-embed-dir:
@@ -286,6 +286,12 @@ GO_TEST_P_FLAG := $(if $(GO_TEST_P),-p $(GO_TEST_P),)
 test: pricing-snapshot ensure-embed-dir
 	go test $(GO_TEST_P_FLAG) -tags "fts5" ./... -v
 
+# Reproducible synthetic ingest, steady-state sync, and analytics measurements.
+.PHONY: perf-sim
+PERF_SIM_FLAGS ?=
+perf-sim: pricing-snapshot ensure-embed-dir
+	CGO_ENABLED=1 go run -buildvcs=true -tags fts5 ./cmd/perfsim $(PERF_SIM_FLAGS)
+
 # Run fast tests only
 test-short: pricing-snapshot ensure-embed-dir
 	go test $(GO_TEST_P_FLAG) -tags "fts5" ./... -short
@@ -358,6 +364,13 @@ bench-gate-config:
 postgres-up:
 	docker compose -f docker-compose.test.yml up -d --wait
 
+# Run opt-in PostgreSQL usage benchmarks against the pinned PG16 service.
+bench-pg-usage: pricing-snapshot
+	docker compose -f docker-compose.test.yml up -d --wait postgres
+	TEST_PG_URL="postgres://agentsview_test:agentsview_test_password@localhost:5433/agentsview_test?sslmode=disable" \
+	CGO_ENABLED=1 go test -tags "fts5,pgtest" ./internal/postgres \
+		-run '^$$' -bench 'BenchmarkPGUsage(Read|Refresh)' -benchmem -count=5
+
 # Stop test PostgreSQL container
 postgres-down:
 	docker compose -f docker-compose.test.yml down
@@ -367,11 +380,11 @@ test-postgres: pricing-snapshot ensure-embed-dir postgres-up
 	@echo "Waiting for postgres to be ready..."
 	@sleep 2
 	TEST_PG_URL="postgres://agentsview_test:agentsview_test_password@localhost:5433/agentsview_test?sslmode=disable" \
-		CGO_ENABLED=1 go test -tags "fts5,pgtest" -v ./internal/postgres/... ./internal/activity/... -count=1
+		CGO_ENABLED=1 go test -tags "fts5,pgtest" -v ./internal/postgres/... ./internal/activity/... -count=1 -timeout=20m
 
 # PostgreSQL integration tests for CI (postgres already running as service)
 test-postgres-ci: pricing-snapshot ensure-embed-dir
-	CGO_ENABLED=1 go test -tags "fts5,pgtest" -v ./internal/postgres/... ./internal/activity/... -count=1
+	CGO_ENABLED=1 go test -tags "fts5,pgtest" -v ./internal/postgres/... ./internal/activity/... -count=1 -timeout=20m
 
 # S3 discovery integration tests. testcontainers starts and tears down a
 # rustfs (S3-compatible) container automatically, so only a working Docker
@@ -545,6 +558,9 @@ docs-build:
 docs-serve:
 	cd docs && bash assets/hydrate-assets.sh && uv run bash ./zensical-docs.sh serve
 
+docs-preview:
+	python3 -m http.server 8000 --directory docs/site
+
 docs-check:
 	bash scripts/check-docs.sh
 
@@ -622,6 +638,7 @@ help:
 	@echo "  test           - Run all tests"
 	@echo "  test-short     - Run fast tests only"
 	@echo "  bench-backends - Benchmark SQLite, DuckDB, and PostgreSQL stores"
+	@echo "  bench-pg-usage - Run opt-in PostgreSQL usage benchmarks against PG16"
 	@echo "  bench-gate     - Run the hot-path benchmarks CI gates PRs on"
 	@echo "  test-postgres  - Run PostgreSQL integration tests"
 	@echo "  test-s3        - Run S3 discovery integration tests (Docker)"

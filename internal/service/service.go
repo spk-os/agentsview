@@ -140,11 +140,13 @@ type SecretFindingList struct {
 // It mirrors the GET /api/v1/search query parameters so both transports
 // produce identical results.
 type SearchRequest struct {
-	Query   string `json:"query"`
-	Project string `json:"project,omitempty"`
-	Sort    string `json:"sort,omitempty"` // "relevance" (default) or "recency"
-	Cursor  int    `json:"cursor,omitempty"`
-	Limit   int    `json:"limit,omitempty"`
+	DateFrom string `json:"date_from,omitempty"`
+	DateTo   string `json:"date_to,omitempty"`
+	Query    string `json:"query"`
+	Project  string `json:"project,omitempty"`
+	Sort     string `json:"sort,omitempty"` // "relevance" (default) or "recency"
+	Cursor   int    `json:"cursor,omitempty"`
+	Limit    int    `json:"limit,omitempty"`
 }
 
 // SessionSearchResult mirrors db.SearchPage for transport: ranked
@@ -168,6 +170,7 @@ type ContentSearchRequest struct {
 	Project, ExcludeProject, Machine, Agent           string
 	Date, DateFrom, DateTo, Timezone, ActiveSince     string
 	IncludeChildren, IncludeAutomated, IncludeOneShot bool
+	ExcludeSessionIDs                                 []string
 	// GitBranch is a branchListSep-joined list of opaque (project, branch) tokens (EncodeBranchFilterToken).
 	GitBranch string
 
@@ -387,6 +390,7 @@ type ListFilter struct {
 	IncludeOneShot   bool   `json:"include_one_shot,omitempty"`
 	IncludeAutomated bool   `json:"include_automated,omitempty"`
 	IncludeChildren  bool   `json:"include_children,omitempty"`
+	IncludeSource    bool   `json:"include_source,omitempty"`
 	Outcome          string `json:"outcome,omitempty"`      // comma-separated
 	HealthGrade      string `json:"health_grade,omitempty"` // comma-separated
 	Termination      string `json:"termination,omitempty"`  // comma-separated

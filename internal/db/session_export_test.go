@@ -503,6 +503,98 @@ func TestSessionSummaryExportRequiresExistingDatabaseID(t *testing.T) {
 	require.ErrorIs(t, err, ErrDatabaseIDMissing)
 }
 
+func TestSessionSummaryExportIdentitySurvivesRebuild(t *testing.T) {
+	ctx := t.Context()
+	source := testDB(t)
+	require.NoError(t, source.SetArchiveIdentityForTest(ctx, "archive-a", strings.Repeat("a", 64)))
+	require.NoError(t, source.SetDatabaseIDForTest(ctx, "generation-one"))
+	insertExportSession(t, source, Session{
+		ID: "retained-session", Project: "project-a", UserMessageCount: 1,
+		EndedAt: Ptr("2026-05-01T10:00:00Z"),
+	})
+	before, err := source.ExportSessionSummaries(ctx, SessionExportOptions{})
+	require.NoError(t, err)
+	require.Len(t, before.Rows, 1)
+	require.NoError(t, source.CloseConnections())
+
+	rebuilt := testDB(t)
+	require.NoError(t, rebuilt.SetDatabaseIDForTest(ctx, "generation-two"))
+	require.NoError(t, rebuilt.CopyArchiveIdentityFrom(source.Path()))
+	count, err := rebuilt.CopyOrphanedDataFrom(source.Path())
+	require.NoError(t, err)
+	require.Equal(t, 1, count)
+	require.NoError(t, rebuilt.CopySessionMetadataFrom(source.Path()))
+	after, err := rebuilt.ExportSessionSummaries(ctx, SessionExportOptions{})
+	require.NoError(t, err)
+	require.Len(t, after.Rows, 1)
+	assert.Equal(t, "archive-a", before.ArchiveID)
+	assert.Equal(t, "archive-a", after.ArchiveID)
+	assert.Equal(t, "generation-one", before.DatabaseID)
+	assert.Equal(t, "generation-two", after.DatabaseID)
+	assert.Equal(t, "retained-session", after.Rows[0].ID)
+	assert.Equal(t, before.Rows[0].ProjectReference.ProjectKey, after.Rows[0].ProjectReference.ProjectKey)
+}
+
+func TestSessionSummaryExportEmptyArchiveRequiresIdentity(t *testing.T) {
+	d := testDB(t)
+	_, err := d.rawWriter().Exec(`DELETE FROM archive_metadata WHERE key = ?`, archiveMetadataArchiveIDKey)
+	require.NoError(t, err)
+	_, err = d.ExportSessionSummaries(t.Context(), SessionExportOptions{})
+	require.ErrorIs(t, err, ErrArchiveIDMissing)
+	var count int
+	require.NoError(t, d.rawWriter().QueryRow(`SELECT count(*) FROM archive_metadata WHERE key = ?`,
+		archiveMetadataArchiveIDKey).Scan(&count))
+	assert.Zero(t, count, "export must not initialize missing identity")
+}
+
+func TestAllSessionExportIdentityUsesRowSnapshot(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	require.NoError(t, d.SetArchiveIdentityForTest(ctx, "archive-before", strings.Repeat("a", 64)))
+	require.NoError(t, d.SetDatabaseIDForTest(ctx, "generation-before"))
+	for _, id := range []string{"session-a", "session-b"} {
+		insertExportSession(t, d, Session{
+			ID: id, Project: "project-a", UserMessageCount: 1,
+			EndedAt: Ptr("2026-05-01T10:00:00Z"),
+		})
+	}
+	_, err := d.getWriter().Exec(`UPDATE sessions
+		SET transcript_revision = '7', local_modified_at = '2026-05-01T10:01:00Z'`)
+	require.NoError(t, err)
+	pages, err := d.exportAllSessionSummaries(ctx, SessionExportOptions{Limit: 1}, func(page int) error {
+		if page == 1 {
+			if _, err := d.getWriter().Exec(`UPDATE sessions
+				SET transcript_revision = '8', local_modified_at = '2026-05-01T10:02:00Z'`); err != nil {
+				return err
+			}
+			if err := d.SetArchiveIdentityForTest(ctx, "archive-after", strings.Repeat("b", 64)); err != nil {
+				return err
+			}
+			return d.SetDatabaseIDForTest(ctx, "generation-after")
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	require.Len(t, pages, 2)
+	for _, page := range pages {
+		assert.Equal(t, "archive-before", page.ArchiveID)
+		assert.Equal(t, "generation-before", page.DatabaseID)
+		require.Len(t, page.Rows, 1)
+		assert.Equal(t, "7", page.Rows[0].TranscriptRevision)
+		require.NotNil(t, page.Rows[0].LocalModifiedAt)
+		assert.Equal(t, "2026-05-01T10:01:00Z", *page.Rows[0].LocalModifiedAt)
+	}
+	current, err := d.ExportSessionSummaries(ctx, SessionExportOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, "archive-after", current.ArchiveID)
+	assert.Equal(t, "generation-after", current.DatabaseID)
+	for _, row := range current.Rows {
+		assert.Equal(t, "8", row.TranscriptRevision)
+		require.NotNil(t, row.LocalModifiedAt)
+		assert.Equal(t, "2026-05-01T10:02:00Z", *row.LocalModifiedAt)
+	}
+}
+
 func TestSessionSummaryExportUsesMessageActivityForOpenSessions(t *testing.T) {
 	d := testSessionExportDB(t)
 	ctx := context.Background()

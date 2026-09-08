@@ -21,9 +21,14 @@ type settingsResponse struct {
 }
 
 type sessionProviderResponse struct {
-	ID          parser.AgentType `json:"id"`
-	DisplayName string           `json:"display_name"`
-	Dirs        []string         `json:"dirs"`
+	ID                 parser.AgentType `json:"id"`
+	DisplayName        string           `json:"display_name"`
+	Dirs               []string         `json:"dirs"`
+	PostAnswerToolWork bool             `json:"post_answer_tool_work,omitzero"`
+	// HomesSupported reports whether the provider accepts alternate home
+	// directories through agent_homes. Homes lists the configured ones.
+	HomesSupported bool     `json:"homes_supported"`
+	Homes          []string `json:"homes"`
 }
 
 // terminalResponse mirrors config.TerminalConfig for JSON output.
@@ -41,4 +46,7 @@ type settingsUpdateRequest struct {
 	RequireAuth    *bool             `json:"require_auth,omitempty"`
 	ChartPalette   *string           `json:"chart_palette,omitempty"`
 	DisabledAgents *[]string         `json:"disabled_agents,omitempty"`
+	// AgentHomes replaces the alternate home list for each listed provider.
+	// An empty list clears that provider's homes.
+	AgentHomes *map[string][]string `json:"agent_homes,omitempty"`
 }

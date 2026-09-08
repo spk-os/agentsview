@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -1500,6 +1501,7 @@ func seedCacheEconomicsMessage(
 		b.input, b.output, b.cacheCreation, b.cacheRead,
 	)
 	m := asstMsg(sessionID, ordinal, "reply")
+	m.Timestamp = ""
 	m.Model = model
 	m.OutputTokens = b.output
 	m.HasOutputTokens = true
@@ -1630,6 +1632,49 @@ func TestGetSessionStats_CacheEconomics(t *testing.T) {
 	wantSavings := money.MustSub(wantWithoutCache, wantSpent)
 	assert.Equal(t, wantSavings, ce.DollarsSavedVsUncached,
 		"DollarsSavedVsUncached")
+}
+
+func TestGetSessionStats_CacheEconomicsUsesHistoricalRates(t *testing.T) {
+	d := testDB(t)
+	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
+		ModelPattern:         "gpt-5.6-luna",
+		InputPerMTok:         money.MustParseDollars("9"),
+		OutputPerMTok:        money.MustParseDollars("9"),
+		CacheCreationPerMTok: money.MustParseDollars("9"),
+		CacheReadPerMTok:     money.MustParseDollars("9"),
+	}}), "UpsertModelPricing")
+
+	for i, fixture := range []struct {
+		id        string
+		timestamp string
+	}{
+		{id: "luna-before", timestamp: "2026-07-29T23:59:59Z"},
+		{id: "luna-after", timestamp: "2026-07-30T00:00:00Z"},
+	} {
+		insertSessionFixture(t, d, sessionFixture{
+			id: fixture.id, agent: "claude", userMsgs: 3,
+			startedAt: hoursAgo(2 + i),
+		})
+		seedCacheEconomicsMessage(
+			t, d, fixture.id, 1, "gpt-5.6-luna", cacheTokenBreakdown{
+				input: 50_000, output: 50_000,
+				cacheCreation: 50_000, cacheRead: 50_000,
+			},
+		)
+		_, err := d.getWriter().Exec(
+			`UPDATE messages SET timestamp = ? WHERE session_id = ?`,
+			fixture.timestamp, fixture.id,
+		)
+		require.NoError(t, err, "set historical message timestamp")
+	}
+
+	stats, err := d.GetSessionStats(t.Context(), StatsFilter{Since: "28d"})
+	require.NoError(t, err)
+	require.NotNil(t, stats.CacheEconomics)
+	assert.Equal(t, money.MustParseDollars("0.501"),
+		stats.CacheEconomics.DollarsSpent)
+	assert.Equal(t, money.MustParseDollars("0.039"),
+		stats.CacheEconomics.DollarsSavedVsUncached)
 }
 
 func TestGetSessionStats_CacheEconomicsClampsRawTokenUsage(t *testing.T) {
@@ -2084,10 +2129,69 @@ func TestReporterTimezone_Precedence(t *testing.T) {
 		reporterTimezone(StatsFilter{}),
 		"valid local name should pass through")
 
-	// No filter, no env, Local sentinel → emit empty fallback.
+	// No filter, no env, Local sentinel → use the platform resolver when it is
+	// available, otherwise retain the existing empty metadata fallback.
 	time.Local = time.FixedZone("Local", 0)
-	assert.Equal(t, "", reporterTimezone(StatsFilter{}),
-		"Local sentinel should not be published")
+	mapped := reporterTimezone(StatsFilter{})
+	if mapped != "" {
+		_, err := time.LoadLocation(mapped)
+		assert.NoError(t, err, "platform timezone must be loadable")
+	}
+}
+
+func TestReporterTimezoneUsesPlatformMapping(t *testing.T) {
+	previousTZ, hadTZ := os.LookupEnv("TZ")
+	require.NoError(t, os.Unsetenv("TZ"))
+	t.Cleanup(func() {
+		if hadTZ {
+			_ = os.Setenv("TZ", previousTZ)
+		} else {
+			_ = os.Unsetenv("TZ")
+		}
+	})
+	oldLocal := time.Local
+	time.Local = time.FixedZone("Local", 0)
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	got := reporterTimezone(StatsFilter{})
+	if runtime.GOOS == "windows" {
+		require.NotEmpty(t, got)
+	}
+	if got != "" {
+		_, err := time.LoadLocation(got)
+		require.NoError(t, err)
+	}
+	t.Logf("platform reporter timezone: %q", got)
+}
+
+func TestGetSessionStatsReportsPlatformTimezone(t *testing.T) {
+	previousTZ, hadTZ := os.LookupEnv("TZ")
+	require.NoError(t, os.Unsetenv("TZ"))
+	t.Cleanup(func() {
+		if hadTZ {
+			_ = os.Setenv("TZ", previousTZ)
+		} else {
+			_ = os.Unsetenv("TZ")
+		}
+	})
+	oldLocal := time.Local
+	time.Local = time.FixedZone("Local", 0)
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	stats, err := testDB(t).GetSessionStats(
+		context.Background(), StatsFilter{Since: "28d"})
+	require.NoError(t, err)
+	if runtime.GOOS == "windows" {
+		require.NotEmpty(t, stats.Temporal.ReporterTimezone)
+	}
+	if stats.Temporal.ReporterTimezone != "" {
+		_, err := time.LoadLocation(stats.Temporal.ReporterTimezone)
+		require.NoError(t, err)
+	}
+	raw, err := json.Marshal(stats.Temporal)
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), `"reporter_timezone"`)
+	t.Logf("stats reporter timezone: %q", stats.Temporal.ReporterTimezone)
 }
 
 func TestGetSessionStats_Temporal_FilterByAgentFlowsThrough(t *testing.T) {

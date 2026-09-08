@@ -44,6 +44,8 @@ type SessionExportOptions struct {
 
 type SessionExportResult struct {
 	SchemaVersion int                               `json:"schema_version"`
+	ArchiveID     string                            `json:"archive_id"`
+	DatabaseID    string                            `json:"database_id"`
 	Rows          []SessionSummaryRow               `json:"rows"`
 	NextCursor    string                            `json:"next_cursor,omitempty"`
 	Pricing       *export.PricingBlock              `json:"pricing,omitempty"`
@@ -52,6 +54,8 @@ type SessionExportResult struct {
 
 type SessionSummaryRow struct {
 	ID                    string                       `json:"id"`
+	TranscriptRevision    string                       `json:"transcript_revision"`
+	LocalModifiedAt       *string                      `json:"local_modified_at"`
 	Project               string                       `json:"-"`
 	ProjectReference      export.ProjectReference      `json:"project"`
 	Machine               string                       `json:"-"`
@@ -298,6 +302,13 @@ func (db *DB) exportSessionSummariesTx(
 			ErrSessionExportCursorReset, cursor.DatabaseID, databaseID,
 		)
 	}
+	archiveID, err := sessionExportMetadataValue(
+		ctx, tx, archiveMetadataArchiveIDKey, ErrArchiveIDMissing,
+		"archive id",
+	)
+	if err != nil {
+		return SessionExportResult{}, err
+	}
 
 	watermark := cursor.Watermark
 	watermarkSort := cursor.WatermarkSort
@@ -310,6 +321,8 @@ func (db *DB) exportSessionSummariesTx(
 	if watermark == "" {
 		return SessionExportResult{
 			SchemaVersion: export.SessionSummarySchemaVersion,
+			ArchiveID:     archiveID,
+			DatabaseID:    databaseID,
 			Rows:          []SessionSummaryRow{},
 			Projects:      map[string]export.ProjectMapEntry{},
 		}, nil
@@ -399,13 +412,6 @@ func (db *DB) exportSessionSummariesTx(
 	if err != nil {
 		return SessionExportResult{}, err
 	}
-	archiveID, err := sessionExportMetadataValue(
-		ctx, tx, archiveMetadataArchiveIDKey, ErrArchiveIDMissing,
-		"archive id",
-	)
-	if err != nil {
-		return SessionExportResult{}, err
-	}
 	archiveSalt, err := sessionExportMetadataValue(
 		ctx, tx, archiveMetadataArchiveSaltKey, ErrArchiveSaltMissing,
 		"archive salt",
@@ -448,6 +454,8 @@ func (db *DB) exportSessionSummariesTx(
 	}
 	return SessionExportResult{
 		SchemaVersion: export.SessionSummarySchemaVersion,
+		ArchiveID:     archiveID,
+		DatabaseID:    databaseID,
 		Rows:          resultRows,
 		NextCursor:    next,
 		Pricing:       pricing,
@@ -645,6 +653,8 @@ func (db *DB) querySessionExportRows(
 	query := `
 SELECT
 	id,
+	transcript_revision,
+	local_modified_at,
 	project,
 	machine,
 	agent,
@@ -683,10 +693,13 @@ LIMIT ?`
 	for sqlRows.Next() {
 		var row SessionSummaryRow
 		var startedAt, endedAt sql.NullString
+		var localModifiedAt sql.NullString
 		var parentID, relationship sql.NullString
 		var automated bool
 		if err := sqlRows.Scan(
 			&row.ID,
+			&row.TranscriptRevision,
+			&localModifiedAt,
 			&row.Project,
 			&row.Machine,
 			&row.Agent,
@@ -710,6 +723,7 @@ LIMIT ?`
 			return nil, fmt.Errorf("scanning session summary export: %w", err)
 		}
 		row.StartedAt = nullStringPtr(startedAt)
+		row.LocalModifiedAt = nullStringPtr(localModifiedAt)
 		row.EndedAt = nullStringPtr(endedAt)
 		row.DurationSeconds = sessionExportDurationSeconds(
 			row.StartedAt, row.EndedAt, row.LastActivityAt)

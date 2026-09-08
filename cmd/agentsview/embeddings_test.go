@@ -196,7 +196,7 @@ func TestVectorGenerationParams(t *testing.T) {
 }
 
 func TestNewVectorEncoderWiresOllamaCPUFallback(t *testing.T) {
-	var cpuCalls atomic.Int32
+	var nativeCalls, cpuCalls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
@@ -207,11 +207,25 @@ func TestNewVectorEncoderWiresOllamaCPUFallback(t *testing.T) {
 				}},
 			}))
 		case "/api/embed":
+			nativeCalls.Add(1)
+			var request struct {
+				Options map[string]any `json:"options"`
+			}
+			require.NoError(t, json.UnmarshalRead(r.Body, &request))
+			if request.Options == nil {
+				require.NoError(t, json.MarshalWrite(w, map[string]any{
+					"model":      "test-model",
+					"embeddings": [][]float32{{0, 0, 0}},
+				}))
+				return
+			}
 			cpuCalls.Add(1)
 			require.NoError(t, json.MarshalWrite(w, map[string]any{
 				"model":      "test-model",
 				"embeddings": [][]float32{{1, 2, 3}},
 			}))
+		case "/api/ps":
+			require.NoError(t, json.MarshalWrite(w, map[string]any{"models": []any{}}))
 		default:
 			require.FailNow(t, "unexpected request path", r.URL.Path)
 		}
@@ -229,13 +243,41 @@ func TestNewVectorEncoderWiresOllamaCPUFallback(t *testing.T) {
 				OllamaCPUFallback: true,
 			},
 		},
-	}, "local", "")
+	}, "local", "", false)
 	require.NoError(t, err)
 
 	out, err := enc(context.Background(), []string{"alpha"})
 	require.NoError(t, err)
 	assert.Equal(t, [][]float32{{1, 2, 3}}, out)
+	assert.Equal(t, int32(3), nativeCalls.Load())
 	assert.Equal(t, int32(1), cpuCalls.Load())
+}
+
+func TestVectorDocumentEncoderSetWiresBuildTokenBudget(t *testing.T) {
+	encoders, err := vectorDocumentEncoderSet(config.VectorEmbeddingsConfig{
+		Model:              "voyage-4-large",
+		Dimension:          1024,
+		ModelContextTokens: 32000,
+		DefaultServer:      "voyage",
+		Servers: map[string]config.VectorEmbeddingsServerConfig{
+			"voyage": {
+				Endpoint:       "https://api.example.com/v1",
+				BatchSize:      4,
+				MaxBatchTokens: 120000,
+				Concurrency:    2,
+				Timeout:        "30s",
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	settings := encoders.ByName["voyage"].Settings
+	assert.Equal(t, vector.EncodeSettings{
+		BatchSize:          4,
+		ModelContextTokens: 32000,
+		MaxBatchTokens:     120000,
+		Concurrency:        2,
+	}, settings)
 }
 
 func TestRecallVectorGenerationExtendsExtractionFingerprint(t *testing.T) {

@@ -298,6 +298,7 @@ func runServe(cfg config.Config, opts serveOptions) {
 		engine = sync.NewEngine(database, sync.EngineConfig{
 			AgentDirs:               cfg.AgentDirs,
 			SourceMachines:          cfg.SourceMachines,
+			ProviderMetadata:        cfg.ProviderMetadata,
 			DisabledAgents:          cfg.DisabledAgents,
 			IncludeCwdPrefixes:      cfg.SyncIncludeCwdPrefixes,
 			ScanProtectedPaths:      cfg.ScanProtectedPaths,
@@ -503,6 +504,11 @@ func runServe(cfg config.Config, opts serveOptions) {
 			newForegroundResyncRunner(ctx, cfg, engine, database),
 		))
 	}
+	if engine != nil {
+		srvOpts = append(srvOpts, server.WithLocalCompactRunner(
+			newForegroundCompactRunner(engine, database),
+		))
+	}
 	srvOpts = append(srvOpts, server.WithArtifactExchangeRunner(
 		newDaemonArtifactExchangeRunner(cfg, database, engine, emitter),
 	))
@@ -566,7 +572,7 @@ func runServe(cfg config.Config, opts serveOptions) {
 		)
 	} else {
 		fmt.Printf(
-			"agentsview %s backend at %s, public at %s (started in %s)\n",
+			"agentsview %s listening at %s, browser URL: %s (started in %s)\n",
 			version, rt.LocalURL, rt.PublicURL,
 			time.Since(start).Round(time.Millisecond),
 		)
@@ -1037,6 +1043,24 @@ func newForegroundResyncRunner(
 	}
 }
 
+// newForegroundCompactRunner keeps archive compaction behind the same
+// non-blocking maintenance barrier as user-triggered sync and resync.
+func newForegroundCompactRunner(
+	engine *sync.Engine, database *db.DB,
+) server.LocalCompactRunner {
+	return func(
+		ctx context.Context, options db.CompactOptions,
+	) (db.CompactResult, error) {
+		var result db.CompactResult
+		err := engine.TryRunExclusive(func() error {
+			var err error
+			result, err = database.Compact(ctx, options)
+			return err
+		})
+		return result, err
+	}
+}
+
 // syncAllReleasingStartupMaintenance runs an incremental pass and, mirroring
 // SyncThenRun, releases startup maintenance when the pass was not cancelled.
 // SyncAll records startup reconciliation on its own but never releases the
@@ -1365,6 +1389,16 @@ func openWriteDB(
 	lock, err := acquireWriteOwnerLock(ctx, writeLockDataDir(cfg))
 	if err != nil {
 		return nil, nil, err
+	}
+	// Settle any interrupted staged compaction before the archive is probed.
+	// Only the canonical archive under the write lock runs this: derived
+	// databases (resync temps, isolated imports) must not interpret the
+	// archive's recovery manifest.
+	if err := db.RecoverCompactManifest(cfg.DBPath); err != nil {
+		_ = lock.Close()
+		return nil, nil, fmt.Errorf(
+			"recovering interrupted archive compaction: %w", err,
+		)
 	}
 	database, err := openDB(cfg)
 	if err != nil {
@@ -2244,11 +2278,21 @@ type watchSyncer = sync.WatchBatchSyncer
 // The daemon queues the batch on the watcher before opening dispatch so the
 // affected roots re-reconcile with backoff.
 func gapReconciliationRetryBatch(gapErr error) sync.WatchBatch {
-	var scoped interface{ ReconciliationRetryRoots() []string }
-	if errors.As(gapErr, &scoped) {
-		if roots := deduplicateStrings(scoped.ReconciliationRetryRoots()); len(roots) > 0 {
-			return sync.WatchBatch{ReconcileRoots: roots}
-		}
+	var pathsSource interface{ ReconciliationRetryPaths() []string }
+	var rootsSource interface{ ReconciliationRetryRoots() []string }
+	var overflowSource interface{ ReconciliationRetryOverflow() bool }
+	var paths, roots []string
+	if errors.As(gapErr, &pathsSource) {
+		paths = deduplicateStrings(pathsSource.ReconciliationRetryPaths())
+	}
+	if errors.As(gapErr, &rootsSource) {
+		roots = deduplicateStrings(rootsSource.ReconciliationRetryRoots())
+	}
+	if errors.As(gapErr, &overflowSource) && overflowSource.ReconciliationRetryOverflow() {
+		return sync.WatchBatch{FullSync: true}
+	}
+	if len(paths) > 0 || len(roots) > 0 {
+		return sync.WatchBatch{Paths: paths, ReconcileRoots: roots}
 	}
 	return sync.WatchBatch{FullSync: true}
 }
@@ -2422,7 +2466,7 @@ func collectWatchRoots(cfg config.Config) (
 			addAgentRoot := func(dir, root string, recursive, exists bool) {
 				addRoot(def.Type, dir, root, recursive, exists)
 			}
-			if providerWatched, polling := collectProviderWatchRoots(def, d, addAgentRoot); providerWatched {
+			if providerWatched, polling := collectProviderWatchRoots(factory, d, addAgentRoot); providerWatched {
 				if polling.persistent {
 					addPersistent(def.Type, d)
 				}
@@ -2478,14 +2522,11 @@ type providerPollingReasons struct {
 }
 
 func collectProviderWatchRoots(
-	def parser.AgentDef,
+	factory parser.ProviderFactory,
 	dir string,
 	addRoot func(dir, root string, recursive, exists bool),
 ) (bool, providerPollingReasons) {
-	factory, ok := parser.ProviderFactoryByType(def.Type)
-	if !ok {
-		return false, providerPollingReasons{}
-	}
+	def := factory.Definition()
 	provider := factory.NewProvider(parser.ProviderConfig{
 		Roots: []string{dir},
 	})

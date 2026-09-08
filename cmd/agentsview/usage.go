@@ -24,6 +24,7 @@ import (
 	"go.kenn.io/agentsview/internal/pricingrefresh"
 	"go.kenn.io/agentsview/internal/service"
 	"go.kenn.io/agentsview/internal/sync"
+	"go.kenn.io/agentsview/internal/timeutil"
 )
 
 // quickSyncMargin pads the mtime cutoff backward from the
@@ -236,13 +237,22 @@ type usageStatuslineReport struct {
 	Agent string      `json:"agent,omitempty"`
 }
 
+func usageDateForTimezone(now time.Time, timezone string) string {
+	loc, err := time.LoadLocation(timezone)
+	if err != nil {
+		loc = time.UTC
+	}
+	return now.In(loc).Format("2006-01-02")
+}
+
 func runUsageStatusline(cfg UsageStatuslineConfig) {
-	today := time.Now().Format("2006-01-02")
+	timezone := localTimezone()
+	today := usageDateForTimezone(time.Now(), timezone)
 	filter := db.UsageFilter{
 		From:     today,
 		To:       today,
 		Agent:    cfg.Agent,
-		Timezone: localTimezone(),
+		Timezone: timezone,
 	}
 
 	ctx := context.Background()
@@ -345,6 +355,7 @@ func ensureFreshData(
 		engine := sync.NewEngine(database, sync.EngineConfig{
 			AgentDirs:          appCfg.AgentDirs,
 			SourceMachines:     appCfg.SourceMachines,
+			ProviderMetadata:   appCfg.ProviderMetadata,
 			DisabledAgents:     appCfg.DisabledAgents,
 			IncludeCwdPrefixes: appCfg.SyncIncludeCwdPrefixes,
 			ScanProtectedPaths: appCfg.ScanProtectedPaths,
@@ -372,6 +383,7 @@ func ensureFreshData(
 	engine := sync.NewEngine(database, sync.EngineConfig{
 		AgentDirs:          appCfg.AgentDirs,
 		SourceMachines:     appCfg.SourceMachines,
+		ProviderMetadata:   appCfg.ProviderMetadata,
 		DisabledAgents:     appCfg.DisabledAgents,
 		IncludeCwdPrefixes: appCfg.SyncIncludeCwdPrefixes,
 		ScanProtectedPaths: appCfg.ScanProtectedPaths,
@@ -479,20 +491,22 @@ func fallbackPricingRates(
 		bands := make([]export.PricingBand, len(p.Bands))
 		for i, band := range p.Bands {
 			bands[i] = export.PricingBand{
-				AboveInputTokens:  band.AboveInputTokens,
-				InputPerMTok:      band.InputPerMTok,
-				OutputPerMTok:     band.OutputPerMTok,
-				CacheWritePerMTok: band.CacheCreationPerMTok,
-				CacheReadPerMTok:  band.CacheReadPerMTok,
+				AboveInputTokens:    band.AboveInputTokens,
+				InputPerMTok:        band.InputPerMTok,
+				OutputPerMTok:       band.OutputPerMTok,
+				CacheWritePerMTok:   band.CacheCreationPerMTok,
+				CacheWrite1hPerMTok: band.CacheCreation1hPerMTok,
+				CacheReadPerMTok:    band.CacheReadPerMTok,
 			}
 		}
 		rates[p.ModelPattern] = export.ModelRates{
-			InputPerMTok:      p.InputPerMTok,
-			OutputPerMTok:     p.OutputPerMTok,
-			CacheWritePerMTok: p.CacheCreationPerMTok,
-			CacheReadPerMTok:  p.CacheReadPerMTok,
-			Source:            export.PricingRowSourceEmbedded,
-			Bands:             bands,
+			InputPerMTok:        p.InputPerMTok,
+			OutputPerMTok:       p.OutputPerMTok,
+			CacheWritePerMTok:   p.CacheCreationPerMTok,
+			CacheWrite1hPerMTok: p.CacheCreation1hPerMTok,
+			CacheReadPerMTok:    p.CacheReadPerMTok,
+			Source:              export.PricingRowSourceEmbedded,
+			Bands:               bands,
 		}
 	}
 	for model, rate := range custom {
@@ -505,6 +519,9 @@ func fallbackPricingRates(
 			},
 			CacheWritePerMTok: money.Money{
 				Microdollars: rate.CacheCreationMicrodollarsPerMTok,
+			},
+			CacheWrite1hPerMTok: money.Money{
+				Microdollars: rate.CacheCreation1hMicrodollarsPerMTok,
 			},
 			CacheReadPerMTok: money.Money{
 				Microdollars: rate.CacheReadMicrodollarsPerMTok,
@@ -648,7 +665,7 @@ func printDailyTable(
 
 // localTimezone returns the IANA name of the system's local timezone.
 func localTimezone() string {
-	return time.Now().Location().String()
+	return timeutil.LocalTimezoneOrUTC()
 }
 
 // fmtCost formats a dollar amount with two decimal places,

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -426,7 +427,7 @@ func (p *PreparedHTTP) ImportActive(ctx context.Context) (SyncStats, error) {
 	}
 	stats, err := p.mirrorImport.pending.Execute(ctx)
 	p.mirrorImport.outcome = stats.JournalOutcome
-	if err != nil || stats.Failed > 0 {
+	if err != nil || !stats.ProcessingComplete() {
 		p.reportDeltaImport(stats)
 		return stats, err
 	}
@@ -562,7 +563,7 @@ func (p *PreparedHTTP) RebuildContributor() (syncpkg.RebuildContributor, error) 
 		contributor.Started = p.sync.Lifecycle.RebuildStarted
 	}
 	contributor.Finished = func(stats syncpkg.SyncStats, err error) {
-		p.commitReady = err == nil && !stats.Aborted && stats.Failed == 0
+		p.commitReady = err == nil && stats.ProcessingComplete()
 		if p.mirrorImport != nil {
 			pendingStats := &p.mirrorImport.pending.Stats
 			pendingStats.SessionsSynced = stats.Synced
@@ -580,7 +581,7 @@ func (p *PreparedHTTP) RebuildContributor() (syncpkg.RebuildContributor, error) 
 				if _, ok := errors.AsType[*rebuildCachePersistError](err); ok {
 					p.mirrorImport.outcome = JournalCachePersistFailed
 					pendingStats.JournalOutcome = JournalCachePersistFailed
-				} else if stats.Failed > 0 || stats.Aborted || err != nil {
+				} else if !stats.ProcessingComplete() || err != nil {
 					p.mirrorImport.outcome = JournalProcessingFailures
 					pendingStats.JournalOutcome = JournalProcessingFailures
 				}
@@ -871,6 +872,35 @@ func (hs HTTPSync) prepareMirror(
 		for path := range fileScopedPaths {
 			observed = append(observed, path)
 			forceFullParseObserved = append(forceFullParseObserved, path)
+		}
+	}
+	// Capture the old index's sessions before replacement or deletion loses
+	// their association. Journal transcript paths so replay uses the current
+	// provider metadata, including titles from remaining homes.
+	indexChanges := append([]string(nil), delta.Deletions...)
+	for _, remotePath := range delta.Fetch {
+		localPath, err := safeRemappedRemotePath(mirrorRoot, remotePath)
+		if err != nil {
+			return nil, err
+		}
+		indexChanges = append(indexChanges, localPath)
+	}
+	for _, indexPath := range indexChanges {
+		if filepath.Base(indexPath) != parser.CodexSessionIndexFilename {
+			continue
+		}
+		parser.EvictCodexSessionIndex(indexPath)
+		for uuid := range parser.CodexSessionIndexTitles(indexPath) {
+			storedPath := hs.DB.GetSessionFilePath(hs.Host + "~codex:" + uuid)
+			remotePath, ok := strings.CutPrefix(storedPath, hs.Host+":")
+			if !ok {
+				continue
+			}
+			path, err := mirrorRelativeRemoteChangePath(mirrorRoot, remotePath)
+			if err != nil {
+				return nil, err
+			}
+			observed = append(observed, path)
 		}
 	}
 	journal, mergeStats, err := mergeMirrorChangesWithForce(

@@ -1602,6 +1602,31 @@ func TestHumaTriggerSyncWorkerRunnerErrorRejectsStream(t *testing.T) {
 		"a failed worker pass must not be reported as a completed sync")
 }
 
+func TestHumaTriggerSyncDoesNotRetryFailures(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		path string
+		err  error
+	}{
+		{"busy without wait", "/api/v1/sync", syncpkg.ErrSyncInProgress},
+		{"worker failed with wait", "/api/v1/sync?wait=true", errors.New("worker failed")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			calls := 0
+			f := newSyncRouteFixture(t, withLocalSyncRunner(
+				func(context.Context, func(syncpkg.Progress)) (syncpkg.SyncStats, error) {
+					calls++
+					return syncpkg.SyncStats{}, tt.err
+				},
+			))
+			w := serveJSON(t, f.handler, http.MethodPost, tt.path, nil)
+			assert.Contains(t, w.Body.String(), "event: error")
+			assert.Contains(t, w.Body.String(), tt.err.Error())
+			assert.Equal(t, 1, calls)
+		})
+	}
+}
+
 func TestHumaTriggerResyncWorkerRunnerErrorRejectsStream(t *testing.T) {
 	f := newSyncRouteFixture(t, withLocalResyncRunner(
 		func(context.Context, func(syncpkg.Progress)) (syncpkg.SyncStats, error) {
@@ -1616,6 +1641,36 @@ func TestHumaTriggerResyncWorkerRunnerErrorRejectsStream(t *testing.T) {
 	assert.Contains(t, body, "resync build reported failed")
 	assert.NotContains(t, body, "event: done",
 		"a failed worker resync must not be reported as a completed resync")
+}
+
+func TestForegroundSyncWorkerDeferredProcessingRejectsStream(t *testing.T) {
+	f := newSyncRouteFixture(t, withLocalSyncRunner(func(
+		context.Context, func(syncpkg.Progress),
+	) (syncpkg.SyncStats, error) {
+		return syncpkg.SyncStats{Deferred: 1}, nil
+	}))
+
+	w := serveJSON(t, f.handler, http.MethodPost, "/api/v1/sync", nil)
+
+	body := w.Body.String()
+	assert.Contains(t, body, "event: error")
+	assert.Contains(t, body, "local sync processing incomplete")
+	assert.NotContains(t, body, "event: done")
+}
+
+func TestForegroundResyncWorkerDeferredProcessingRejectsStream(t *testing.T) {
+	f := newSyncRouteFixture(t, withLocalResyncRunner(func(
+		context.Context, func(syncpkg.Progress),
+	) (syncpkg.SyncStats, error) {
+		return syncpkg.SyncStats{Deferred: 1}, nil
+	}))
+
+	w := serveJSON(t, f.handler, http.MethodPost, "/api/v1/resync", nil)
+
+	body := w.Body.String()
+	assert.Contains(t, body, "event: error")
+	assert.Contains(t, body, "local sync processing incomplete")
+	assert.NotContains(t, body, "event: done")
 }
 
 func TestForegroundSyncReleasesDeferredStartupMaintenance(t *testing.T) {

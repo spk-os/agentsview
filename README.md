@@ -9,11 +9,15 @@ accounts, everything local.
 
 ## Install
 
-```bash
-# macOS / Linux
-curl -fsSL https://agentsview.io/install.sh | bash
+**macOS and Linux:**
 
-# Windows
+```bash
+curl -fsSL https://agentsview.io/install.sh | bash
+```
+
+**Windows (PowerShell):**
+
+```powershell
 powershell -ExecutionPolicy ByPass -c "irm https://agentsview.io/install.ps1 | iex"
 ```
 
@@ -37,10 +41,10 @@ docker run --rm -p 127.0.0.1:8080:8080 \
 
 ```bash
 agentsview serve           # start the server in the foreground
-agentsview daemon start    # start the writable SQLite daemon
+agentsview daemon start    # alternatively, start the same server in the background
 agentsview daemon status   # show daemon status
 agentsview daemon restart  # restart from current configuration
-agentsview daemon stop     # stop the writable daemon
+agentsview daemon stop     # stop the server, web UI, and sync
 agentsview session list    # read from the daemon if warm, otherwise SQLite
 agentsview usage daily     # print daily cost summary
 ```
@@ -48,6 +52,13 @@ agentsview usage daily     # print daily cost summary
 On first run, agentsview discovers sessions from every supported agent on your
 machine, syncs them into a local SQLite database, and serves a web UI at
 `http://127.0.0.1:8080`.
+
+The daemon is the server: the web UI, API, session sync, and file watchers share
+one process. Choose `serve` for a foreground process or `daemon start` for a
+background process. Running `serve` when a compatible daemon is already running
+reports its URL and exits. `daemon stop` and `serve stop` both stop that
+writable server, including sync; `serve stop` also stops read-only mirror
+servers for the same data directory.
 
 For Devin CLI, point `DEVIN_DIR` or `devin_dirs` at the local root that contains
 `cli/` — for example `~/Library/Application Support/devin` on macOS,
@@ -68,6 +79,9 @@ daemon. Read-only CLI commands attach to it when it is already running, but fall
 back to direct read-only SQLite on a cold archive so one-off scripts stay fast.
 Commands that need fresh data or need to write, such as `sync`, `usage`,
 `token-use`, `pg push`, and `duckdb push`, auto-start the daemon when needed.
+The server remains running after these commands exit and also serves the web UI.
+For a one-shot sync with no background server, stop the daemon first and run
+`AGENTSVIEW_NO_DAEMON=1 agentsview sync`.
 
 Use `agentsview daemon start` when you want to start the writable SQLite daemon
 explicitly. It loads the normal effective configuration from `config.toml` and
@@ -99,9 +113,13 @@ agentsview serve --public-url http://127.0.0.1:18080
 agentsview serve --public-url https://your-workspace.exe.dev
 ```
 
-Use `--public-origin` (repeatable or comma-separated) to trust additional
-browser origins. If you expose the UI beyond loopback, also enable
-`--require-auth`.
+`--public-url` also selects the URL opened on startup; it does not configure a
+listener or external proxy. Use `--no-browser` on a headless server, or use
+`--public-origin` (repeatable or comma-separated) on its own for trust-only
+configuration. If you expose the UI beyond loopback, also enable
+`--require-auth`. See
+[Remote Access](https://agentsview.io/remote-access/#public-url-and-trusted-origins)
+for the listener, browser URL, and managed Caddy port rules.
 
 ## Docker
 
@@ -183,11 +201,9 @@ reverse proxy.
 
 ## Token Usage and Cost Tracking
 
-`agentsview usage` is a fast, local replacement for ccusage and similar tools.
-It tracks token consumption and compute costs across **all** your coding agents
--- not just Claude Code. Because session data is already indexed in SQLite,
-queries are over 100x faster than tools that re-parse raw session files on every
-run.
+`agentsview usage` tracks token consumption and compute costs across **all**
+your coding agents -- not just Claude Code. Reports read from the same local
+SQLite archive that powers the UI.
 
 ```bash
 # Daily cost summary (default: last 30 days)
@@ -253,7 +269,8 @@ compatibility and now also reports cost estimates.
 For one exact non-interactive `claude -p` or `codex exec --json` execution in
 CI, use `agentsview capture run`. It preserves the child streams and exit
 outcome, writes a separate versioned usage result, and starts no daemon, web
-server, or watcher. See [One-shot CI capture](https://agentsview.io/one-shot-capture/).
+server, or watcher. See
+[One-shot CI capture](https://agentsview.io/one-shot-capture/).
 
 ## Session Stats
 
@@ -682,7 +699,7 @@ ______________________________________________________________________
 
 ## Development
 
-Requires Go 1.27+ (CGO), Node.js 22+.
+Requires Go 1.27+ (CGO), Node.js 24.11+.
 
 ```bash
 make dev            # Go server (dev mode)

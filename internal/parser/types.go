@@ -28,6 +28,7 @@ const (
 	AgentKiloLegacy     AgentType = "kilo-legacy"
 	AgentOpenHands      AgentType = "openhands"
 	AgentCursor         AgentType = "cursor"
+	AgentCursorIDE      AgentType = "cursor-ide"
 	AgentIflow          AgentType = "iflow"
 	AgentAmp            AgentType = "amp"
 	AgentZencoder       AgentType = "zencoder"
@@ -85,16 +86,23 @@ const AgentDeepSeekHarness AgentType = "deepseek-harness"
 // layout, configuration keys, and session ID conventions.
 type AgentDef struct {
 	Type              AgentType
-	DisplayName       string   // "Claude Code", "Codex", etc.
-	EnvVar            string   // env var for dir override
-	DefaultRootEnvVar string   // env var that re-roots DefaultDirs before $HOME fallback
-	ConfigKey         string   // TOML key in config.toml ("" = none)
-	DefaultDirs       []string // paths relative to $HOME
-	IDPrefix          string   // session ID prefix ("" for Claude)
-	WatchSubdirs      []string // subdirs to watch (nil = watch root)
-	ShallowWatch      bool     // true = watch root only, rely on periodic sync for subdirs
-	FileBased         bool     // false for DB-backed agents
-	Usage             UsageCapabilities
+	DisplayName       string // "Claude Code", "Codex", etc.
+	EnvVar            string // env var for dir override
+	DefaultRootEnvVar string // env var that re-roots DefaultDirs before $HOME fallback
+	ConfigKey         string // TOML key in config.toml ("" = none)
+	// HomeConfigKey is the TOML key for an array of alternate agent home
+	// directories ("" = none). Each home re-roots DefaultDirs the same way
+	// DefaultRootEnvVar does, and the derived roots are additive.
+	HomeConfigKey string
+	DefaultDirs   []string // paths relative to $HOME
+	IDPrefix      string   // session ID prefix ("" for Claude)
+	WatchSubdirs  []string // subdirs to watch (nil = watch root)
+	ShallowWatch  bool     // true = watch root only, rely on periodic sync for subdirs
+	FileBased     bool     // false for DB-backed agents
+	Usage         UsageCapabilities
+	// PostAnswerToolWork marks transcript formats that may emit their
+	// user-facing answer before later tool calls in the same turn.
+	PostAnswerToolWork bool
 
 	// PeriodicReconcile opts the agent into scheduled scoped reconciliation
 	// when its declared watcher coverage is deliberately non-authoritative,
@@ -138,6 +146,7 @@ var Registry = []AgentDef{
 		EnvVar:            "CLAUDE_PROJECTS_DIR",
 		DefaultRootEnvVar: "CLAUDE_CONFIG_DIR",
 		ConfigKey:         "claude_project_dirs",
+		HomeConfigKey:     "claude_homes",
 		DefaultDirs:       []string{".claude/projects"},
 		IDPrefix:          "",
 		FileBased:         true,
@@ -163,10 +172,12 @@ var Registry = []AgentDef{
 		ShallowWatch: true,
 	},
 	{
-		Type:        AgentCodex,
-		DisplayName: "Codex",
-		EnvVar:      "CODEX_SESSIONS_DIR",
-		ConfigKey:   "codex_sessions_dirs",
+		Type:              AgentCodex,
+		DisplayName:       "Codex",
+		EnvVar:            "CODEX_SESSIONS_DIR",
+		DefaultRootEnvVar: "CODEX_HOME",
+		ConfigKey:         "codex_sessions_dirs",
+		HomeConfigKey:     "codex_homes",
 		DefaultDirs: []string{
 			".codex/sessions",
 			".codex/archived_sessions",
@@ -174,6 +185,7 @@ var Registry = []AgentDef{
 		IDPrefix:              "codex:",
 		FileBased:             true,
 		ShallowWatchRootsFunc: ResolveCodexShallowWatchRoots,
+		PostAnswerToolWork:    true,
 	},
 	{
 		// TRAE CLI 2.0 is a closed-source fork of codex-rs and writes
@@ -192,8 +204,9 @@ var Registry = []AgentDef{
 			// this flat directory, exactly as `codex archive` does.
 			".trae/cli/archived_sessions",
 		},
-		IDPrefix:  "traex:",
-		FileBased: true,
+		IDPrefix:           "traex:",
+		FileBased:          true,
+		PostAnswerToolWork: true,
 		// No ShallowWatchRootsFunc: that hook exists for Codex's sibling
 		// session_index.jsonl, which TraeX never writes. Watching
 		// ~/.trae/cli shallowly would deliver nothing but churn from the
@@ -313,6 +326,28 @@ var Registry = []AgentDef{
 		DefaultDirs: []string{".cursor/projects"},
 		IDPrefix:    "cursor:",
 		FileBased:   true,
+	},
+	{
+		// Cursor IDE (the GUI editor) is a distinct product from Cursor Agent
+		// (the CLI, see AgentCursor above): it stores every chat session in
+		// one shared VS Code-style global-state SQLite database
+		// (state.vscdb), fanned out into one session per composer addressed
+		// by a "<db>#<composerID>" virtual path.
+		Type:        AgentCursorIDE,
+		DisplayName: "Cursor IDE",
+		EnvVar:      "CURSOR_IDE_DIR",
+		ConfigKey:   "cursor_ide_dirs",
+		DefaultDirs: cursorIDEDefaultDirs(),
+		IDPrefix:    "cursor-ide:",
+		FileBased:   true,
+		// state.vscdb is VS Code's shared global-state database: besides
+		// Cursor's own chat data, its ItemTable co-locates Cursor's live
+		// auth tokens (observed keys cursorAuth/accessToken and
+		// cursorAuth/refreshToken) plus whatever other installed extensions
+		// have stored there, and composerData blobs carry per-composer sync
+		// encryption keys. Remote sync stays disabled until there is an
+		// allowlisted export schema, matching Omnigent's chat.db precedent.
+		RemoteSyncExcluded: true,
 	},
 	{
 		Type:        AgentAmp,
@@ -595,7 +630,7 @@ var Registry = []AgentDef{
 		EnvVar:      "KIRO_SESSIONS_DIR",
 		ConfigKey:   "kiro_dirs",
 		DefaultDirs: []string{
-			".kiro/sessions/cli",
+			".kiro/sessions",
 			".local/share/kiro-cli",
 		},
 		IDPrefix:  "kiro:",
@@ -875,7 +910,7 @@ var Registry = []AgentDef{
 		DisplayName:    "IcodeMate",
 		EnvVar:         "ICODEMATE_DIR",
 		ConfigKey:      "icodemate_dirs",
-		DefaultDirs:    []string{".local/share/icodemate"},
+		DefaultDirs:    []string{".local/share/icodemate", ".icodemate/cli/projects"},
 		IDPrefix:       "icodemate:",
 		WatchSubdirs:   []string{"storage/session_diff"},
 		FileBased:      true,
@@ -980,6 +1015,13 @@ func AgentByType(t AgentType) (AgentDef, bool) {
 func RemoteSyncExcludedAgent(agent AgentType) bool {
 	def, ok := AgentByType(agent)
 	return ok && def.RemoteSyncExcluded
+}
+
+// AgentHasPostAnswerToolWork reports whether the agent may continue calling
+// tools after emitting its user-facing answer. Unknown agents return false.
+func AgentHasPostAnswerToolWork(agent AgentType) bool {
+	def, ok := AgentByType(agent)
+	return ok && def.PostAnswerToolWork
 }
 
 // AgentNameLacksPerMessageTokenData reports whether the named agent
@@ -1271,7 +1313,10 @@ type ParsedMessage struct {
 	ToolCalls     []ParsedToolCall
 	ToolResults   []ParsedToolResult
 
-	Model            string
+	Model string
+	// ProviderID identifies the billing provider for this response, such as
+	// Posit Assistant's "positai" managed service or BYO "anthropic".
+	ProviderID       string
 	TokenUsage       jsontext.Value
 	ContextTokens    int
 	OutputTokens     int
@@ -1318,6 +1363,7 @@ type ParsedUsageEvent struct {
 	MessageOrdinal           *int
 	Source                   string
 	Model                    string
+	ProviderID               string
 	InputTokens              int
 	OutputTokens             int
 	CacheCreationInputTokens int

@@ -54,7 +54,7 @@ type ProxyConfig struct {
 	Bin string `json:"bin,omitempty" toml:"bin"`
 	// BindHost is the local interface/IP the proxy binds to.
 	BindHost string `json:"bind_host,omitempty" toml:"bind_host"`
-	// PublicPort is the external port exposed by the proxy.
+	// PublicPort selects the managed proxy listener port and public URL port.
 	PublicPort int `json:"public_port,omitempty" toml:"public_port"`
 	// TLSCert and TLSKey are used by managed HTTPS mode.
 	TLSCert string `json:"tls_cert,omitempty" toml:"tls_cert"`
@@ -161,9 +161,11 @@ type VectorConfig struct {
 // Model identity (model, dimension, request_dimensions, max_input_chars,
 // query_prefix, document_prefix, input_suffix) is deliberately global rather
 // than per-server: it joins the generation fingerprint, and query vectors are
-// only comparable to stored document vectors from the same space. Servers
-// differ only in transport and capacity, so a build run on any server produces
-// vectors every other server's queries can search.
+// only comparable to stored document vectors from the same space.
+// ModelContextTokens is also global because it describes the model, but only
+// controls conservative request batching and does not join the fingerprint.
+// Servers differ only in transport and capacity, so a build run on any server
+// produces vectors every other server's queries can search.
 type VectorEmbeddingsConfig struct {
 	Model     string `toml:"model" json:"model"`
 	Dimension int    `toml:"dimension" json:"dimension"`
@@ -179,6 +181,11 @@ type VectorEmbeddingsConfig struct {
 	// MaxInputChars caps the rune length of each chunk sent for
 	// embedding. Default 8192.
 	MaxInputChars int `toml:"max_input_chars" json:"max_input_chars"`
+	// ModelContextTokens is the maximum tokens the model accepts for one
+	// input. When a server sets MaxBatchTokens, builds conservatively charge
+	// this full amount for every input while composing request batches.
+	// Zero leaves token-budget batching disabled. Default 0.
+	ModelContextTokens int `toml:"model_context_tokens" json:"model_context_tokens,omitempty"`
 	// QueryPrefix is prepended verbatim to search queries before embedding.
 	// It allows instruction-tuned models to distinguish queries from indexed
 	// documents. Changing it cuts a new vector generation. Default empty.
@@ -215,6 +222,10 @@ type VectorEmbeddingsServerConfig struct {
 	APIKeyEnv string `toml:"api_key_env" json:"api_key_env,omitempty"`
 	// BatchSize is the number of inputs sent per HTTP call. Default 32.
 	BatchSize int `toml:"batch_size" json:"batch_size"`
+	// MaxBatchTokens is the provider's maximum total input tokens per HTTP
+	// call. When set with ModelContextTokens, builds reduce BatchSize so the
+	// worst-case request remains within this cap. Zero disables the cap.
+	MaxBatchTokens int `toml:"max_batch_tokens" json:"max_batch_tokens,omitempty"`
 	// Concurrency is the number of documents embedded in parallel during a
 	// build against this server. Sequential requests leave a build
 	// round-trip-bound against remote endpoints, so the default is 4;
@@ -223,8 +234,11 @@ type VectorEmbeddingsServerConfig struct {
 	// Timeout is a parseable duration string applied to each HTTP
 	// call. Default "30s".
 	Timeout string `toml:"timeout" json:"timeout"`
-	// MaxRetries is the maximum total attempts on 429/5xx/network errors
-	// (4xx fails fast); 0 means one attempt. Default 3.
+	// MaxRetries is the maximum total attempts on retryable errors other than
+	// document-build 429 rate limits, which retry until success or
+	// cancellation instead of consuming this budget (see
+	// vector.EncoderConfig.RetryRateLimits). Other 4xx responses fail fast;
+	// 0 means one attempt. Default 3.
 	MaxRetries int `toml:"max_retries" json:"max_retries"`
 }
 
@@ -328,6 +342,11 @@ func (c VectorConfig) Validate() error {
 			"[vector.embeddings] max_input_chars must be greater than 0, got %d",
 			c.Embeddings.MaxInputChars)
 	}
+	if c.Embeddings.ModelContextTokens < 0 {
+		return fmt.Errorf(
+			"[vector.embeddings] model_context_tokens must not be negative, got %d",
+			c.Embeddings.ModelContextTokens)
+	}
 	if err := c.Embeddings.validateServers(); err != nil {
 		return err
 	}
@@ -381,7 +400,7 @@ func (c VectorEmbeddingsConfig) validateServers() error {
 		}
 	}
 	for _, name := range sortedServerNames(c.Servers) {
-		if err := c.Servers[name].validate(name); err != nil {
+		if err := c.Servers[name].validate(name, c.ModelContextTokens); err != nil {
 			return err
 		}
 	}
@@ -389,7 +408,7 @@ func (c VectorEmbeddingsConfig) validateServers() error {
 }
 
 // validate checks one named server's transport settings.
-func (c VectorEmbeddingsServerConfig) validate(name string) error {
+func (c VectorEmbeddingsServerConfig) validate(name string, modelContextTokens int) error {
 	section := fmt.Sprintf("[vector.embeddings.servers.%s]", name)
 	if c.Endpoint == "" {
 		return fmt.Errorf("%s endpoint is required", section)
@@ -409,6 +428,19 @@ func (c VectorEmbeddingsServerConfig) validate(name string) error {
 	}
 	if c.BatchSize <= 0 {
 		return fmt.Errorf("%s batch_size must be greater than 0, got %d", section, c.BatchSize)
+	}
+	if c.MaxBatchTokens < 0 {
+		return fmt.Errorf(
+			"%s max_batch_tokens must not be negative, got %d", section, c.MaxBatchTokens)
+	}
+	if c.MaxBatchTokens > 0 && modelContextTokens <= 0 {
+		return fmt.Errorf(
+			"%s max_batch_tokens requires [vector.embeddings] model_context_tokens", section)
+	}
+	if c.MaxBatchTokens > 0 && c.MaxBatchTokens < modelContextTokens {
+		return fmt.Errorf(
+			"%s max_batch_tokens (%d) must be at least model_context_tokens (%d)",
+			section, c.MaxBatchTokens, modelContextTokens)
 	}
 	if c.Concurrency <= 0 {
 		return fmt.Errorf("%s concurrency must be greater than 0, got %d", section, c.Concurrency)
@@ -499,7 +531,10 @@ type CustomModelRate struct {
 	InputMicrodollarsPerMTok         int64 `json:"input_microdollars_per_mtok" toml:"input_microdollars_per_mtok"`
 	OutputMicrodollarsPerMTok        int64 `json:"output_microdollars_per_mtok" toml:"output_microdollars_per_mtok"`
 	CacheCreationMicrodollarsPerMTok int64 `json:"cache_creation_microdollars_per_mtok,omitempty" toml:"cache_creation_microdollars_per_mtok"`
-	CacheReadMicrodollarsPerMTok     int64 `json:"cache_read_microdollars_per_mtok,omitempty" toml:"cache_read_microdollars_per_mtok"`
+	// Zero means no separate 1h rate: 1h-TTL cache writes then bill at
+	// cache_creation_microdollars_per_mtok.
+	CacheCreation1hMicrodollarsPerMTok int64 `json:"cache_creation_1h_microdollars_per_mtok,omitempty" toml:"cache_creation_1h_microdollars_per_mtok"`
+	CacheReadMicrodollarsPerMTok       int64 `json:"cache_read_microdollars_per_mtok,omitempty" toml:"cache_read_microdollars_per_mtok"`
 }
 
 func decodeCustomModelPricing(data string) (map[string]CustomModelRate, error) {
@@ -515,7 +550,7 @@ func decodeCustomModelPricing(data string) (map[string]CustomModelRate, error) {
 			continue
 		}
 		return nil, fmt.Errorf(
-			"%s: unsupported pricing field; use input_microdollars_per_mtok, output_microdollars_per_mtok, cache_creation_microdollars_per_mtok, or cache_read_microdollars_per_mtok",
+			"%s: unsupported pricing field; use input_microdollars_per_mtok, output_microdollars_per_mtok, cache_creation_microdollars_per_mtok, cache_creation_1h_microdollars_per_mtok, or cache_read_microdollars_per_mtok",
 			key.String(),
 		)
 	}
@@ -523,6 +558,7 @@ func decodeCustomModelPricing(data string) (map[string]CustomModelRate, error) {
 		if rate.InputMicrodollarsPerMTok < 0 ||
 			rate.OutputMicrodollarsPerMTok < 0 ||
 			rate.CacheCreationMicrodollarsPerMTok < 0 ||
+			rate.CacheCreation1hMicrodollarsPerMTok < 0 ||
 			rate.CacheReadMicrodollarsPerMTok < 0 {
 			return nil, fmt.Errorf(
 				"custom_model_pricing.%s: rates must not be negative", model)
@@ -652,9 +688,17 @@ type Config struct {
 
 	// SessionSources contains resolved structured sources. SourceMachines maps
 	// each effective configured root to its machine label for sync.
-	SessionSources       []SessionSource                        `json:"-" toml:"-"`
-	SourceMachines       map[parser.AgentType]map[string]string `json:"-" toml:"-"`
+	SessionSources []SessionSource                        `json:"-" toml:"-"`
+	SourceMachines map[parser.AgentType]map[string]string `json:"-" toml:"-"`
+	// ProviderMetadata holds provider-resolved metadata directories keyed by
+	// canonical transcript root. It is computed once while loading configuration.
+	ProviderMetadata     map[parser.AgentType]map[string][]string `json:"-" toml:"-"`
 	sessionSourceConfigs []sessionSourceConfig
+
+	// agentHomes holds alternate agent home directories from the config
+	// file, keyed by agent. Each home derives the agent's native session
+	// roots during resolution and is additive to every other root source.
+	agentHomes map[parser.AgentType][]string
 
 	// agentDirSource tracks how each agent's dirs were
 	// set so loadFile doesn't override env-set values.
@@ -752,6 +796,9 @@ func (c Config) ResolveDirs(agent parser.AgentType) []string {
 // ingestion. Remote import and export deliberately use the full registry.
 func (c Config) LocalProviderFactories() []parser.ProviderFactory {
 	factories := parser.ProviderFactories()
+	for i, factory := range factories {
+		factories[i] = parser.ConfigureProviderFactory(factory, c.ProviderMetadata[factory.Definition().Type])
+	}
 	return slices.DeleteFunc(factories, func(factory parser.ProviderFactory) bool {
 		return c.AgentDisabled(factory.Definition().Type)
 	})
@@ -1018,16 +1065,71 @@ func reRootDefaultDir(root, rel string) string {
 	return root
 }
 
+// decodeStringArray converts a raw TOML value into a string slice. It logs
+// and reports false when the value is not an array of strings.
+func decodeStringArray(key string, rawVal any) ([]string, bool) {
+	rawSlice, ok := rawVal.([]any)
+	if !ok {
+		log.Printf("config: %s: expected string array: got %T", key, rawVal)
+		return nil, false
+	}
+	values := make([]string, 0, len(rawSlice))
+	for _, v := range rawSlice {
+		s, ok := v.(string)
+		if !ok {
+			log.Printf(
+				"config: %s: expected string array: element is %T", key, v,
+			)
+			return nil, false
+		}
+		values = append(values, s)
+	}
+	return values, true
+}
+
+// dedupeTrimmedStrings trims each value and drops empty and repeated
+// entries while preserving first-seen order.
+func dedupeTrimmedStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, raw := range values {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			continue
+		}
+		if _, dup := seen[value]; dup {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
+// AgentHomeDirs derives the native session roots that an agent keeps under
+// an alternate home directory, mirroring how DefaultRootEnvVar re-roots the
+// agent's default directories. It returns nil for agents without defaults.
+func AgentHomeDirs(def parser.AgentDef, home string) []string {
+	if len(def.DefaultDirs) == 0 {
+		return nil
+	}
+	dirs := make([]string, 0, len(def.DefaultDirs))
+	for _, rel := range def.DefaultDirs {
+		dirs = append(dirs, reRootDefaultDir(home, rel))
+	}
+	return dirs
+}
+
 // Load builds a Config by layering: defaults < config file < env < flags.
 // The provided FlagSet must already be parsed by the caller.
 // Only flags that were explicitly set override the lower layers.
 func Load(fs *flag.FlagSet) (Config, error) {
-	cfg, err := LoadMinimal()
+	cfg, err := loadConfigLayers()
 	if err != nil {
 		return cfg, err
 	}
 	applyFlags(&cfg, fs)
-	if err := finalize(&cfg); err != nil {
+	if err := finishLoadedConfig(&cfg); err != nil {
 		return cfg, err
 	}
 	return cfg, nil
@@ -1035,12 +1137,12 @@ func Load(fs *flag.FlagSet) (Config, error) {
 
 // LoadPFlags builds a Config from a parsed Cobra/pflag FlagSet.
 func LoadPFlags(fs *pflag.FlagSet) (Config, error) {
-	cfg, err := LoadMinimal()
+	cfg, err := loadConfigLayers()
 	if err != nil {
 		return cfg, err
 	}
 	applyPFlags(&cfg, fs)
-	if err := finalize(&cfg); err != nil {
+	if err := finishLoadedConfig(&cfg); err != nil {
 		return cfg, err
 	}
 	return cfg, nil
@@ -1109,6 +1211,18 @@ func loadPGServeBase() (Config, error) {
 // without parsing CLI flags. Use this for subcommands that manage
 // their own flag sets.
 func LoadMinimal() (Config, error) {
+	cfg, err := loadConfigLayers()
+	if err != nil {
+		return cfg, err
+	}
+	if err := finishLoadedConfig(&cfg); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
+}
+
+// loadConfigLayers leaves runtime roots unresolved until flags are applied.
+func loadConfigLayers() (Config, error) {
 	cfg, err := Default()
 	if err != nil {
 		return cfg, err
@@ -1121,14 +1235,18 @@ func LoadMinimal() (Config, error) {
 	if err := cfg.loadFile(); err != nil {
 		return cfg, fmt.Errorf("loading config file: %w", err)
 	}
-	if err := finalize(&cfg); err != nil {
-		return cfg, err
+	return cfg, nil
+}
+
+func finishLoadedConfig(cfg *Config) error {
+	if err := finalize(cfg); err != nil {
+		return err
 	}
 	if err := cfg.ensureCursorSecret(); err != nil {
-		return cfg, fmt.Errorf("ensuring cursor secret: %w", err)
+		return fmt.Errorf("ensuring cursor secret: %w", err)
 	}
 	cfg.DBPath = filepath.Join(cfg.DataDir, "sessions.db")
-	return cfg, nil
+	return nil
 }
 
 // LoadReadOnly builds a Config from defaults, env, and config.toml without
@@ -1501,6 +1619,9 @@ func (c *Config) applyConfigTOML(data string) error {
 	if meta.IsDefined("vector", "embeddings", "max_input_chars") {
 		c.Vector.Embeddings.MaxInputChars = file.Vector.Embeddings.MaxInputChars
 	}
+	if meta.IsDefined("vector", "embeddings", "model_context_tokens") {
+		c.Vector.Embeddings.ModelContextTokens = file.Vector.Embeddings.ModelContextTokens
+	}
 	if meta.IsDefined("vector", "embeddings", "query_prefix") {
 		c.Vector.Embeddings.QueryPrefix = file.Vector.Embeddings.QueryPrefix
 	}
@@ -1585,6 +1706,26 @@ func (c *Config) applyConfigTOML(data string) error {
 		c.sessionSourceConfigs = append([]sessionSourceConfig(nil), file.SessionSources...)
 	}
 
+	for _, def := range parser.Registry {
+		if def.HomeConfigKey == "" {
+			continue
+		}
+		rawVal, exists := raw[def.HomeConfigKey]
+		if !exists {
+			continue
+		}
+		homes, ok := decodeStringArray(def.HomeConfigKey, rawVal)
+		if !ok {
+			continue
+		}
+		if c.agentHomes == nil {
+			c.agentHomes = make(map[parser.AgentType][]string)
+		}
+		// Repeated spellings would register the same roots twice and give
+		// the settings UI duplicate list keys; keep the first occurrence.
+		c.agentHomes[def.Type] = dedupeTrimmedStrings(homes)
+	}
+
 	// Parse config-file dir arrays for agents that have a
 	// ConfigKey. Only apply when not already set by env var.
 	for _, def := range parser.Registry {
@@ -1598,34 +1739,63 @@ func (c *Config) applyConfigTOML(data string) error {
 		if c.agentDirSource[def.Type] == dirEnv {
 			continue
 		}
-		rawSlice, ok := rawVal.([]any)
-		if !ok {
-			log.Printf(
-				"config: %s: expected string array: got %T",
-				def.ConfigKey, rawVal,
-			)
-			continue
-		}
-		dirs := make([]string, 0, len(rawSlice))
-		valid := true
-		for _, v := range rawSlice {
-			s, ok := v.(string)
-			if !ok {
-				log.Printf(
-					"config: %s: expected string array: element is %T",
-					def.ConfigKey, v,
-				)
-				valid = false
-				break
-			}
-			dirs = append(dirs, s)
-		}
-		if valid {
+		if dirs, ok := decodeStringArray(def.ConfigKey, rawVal); ok {
 			c.AgentDirs[def.Type] = dirs
 			c.agentDirSource[def.Type] = dirFile
 		}
 	}
 	return nil
+}
+
+// ConfiguredAgentHomes returns the alternate home directories configured
+// for an agent, as written in the config file, or nil when none are set.
+func (c *Config) ConfiguredAgentHomes(agent parser.AgentType) []string {
+	homes := c.agentHomes[agent]
+	if len(homes) == 0 {
+		return nil
+	}
+	return append([]string(nil), homes...)
+}
+
+// NormalizeAgentHomes validates a settings update for alternate agent
+// homes. It rejects agents without home support and empty or S3 entries,
+// trims whitespace, and drops repeated spellings while keeping order.
+func NormalizeAgentHomes(
+	values map[string][]string,
+) (map[parser.AgentType][]string, error) {
+	normalized := make(map[parser.AgentType][]string, len(values))
+	for rawAgent, homes := range values {
+		agent := parser.AgentType(strings.ToLower(strings.TrimSpace(rawAgent)))
+		def, ok := parser.AgentByType(agent)
+		if !ok {
+			return nil, fmt.Errorf(
+				`agent_homes: unknown session provider %q`, rawAgent)
+		}
+		if def.HomeConfigKey == "" {
+			return nil, fmt.Errorf(
+				`agent_homes: %q does not support alternate homes`, agent)
+		}
+		if _, dup := normalized[agent]; dup {
+			return nil, fmt.Errorf(
+				`agent_homes: session provider %q is listed more than once`, agent)
+		}
+		seen := make(map[string]struct{}, len(homes))
+		cleaned := make([]string, 0, len(homes))
+		for i, raw := range homes {
+			home := strings.TrimSpace(raw)
+			if _, err := normalizeAgentHomeDir(home); err != nil {
+				return nil, fmt.Errorf(
+					"agent_homes: %s: entry %d: %w", def.HomeConfigKey, i+1, err)
+			}
+			if _, dup := seen[home]; dup {
+				continue
+			}
+			seen[home] = struct{}{}
+			cleaned = append(cleaned, home)
+		}
+		normalized[agent] = cleaned
+	}
+	return normalized, nil
 }
 
 func (c *Config) ensureCursorSecret() error {
@@ -1818,16 +1988,16 @@ func (f *stringListFlag) Type() string {
 // RegisterServeFlags registers serve-command flags on fs.
 // The caller must call fs.Parse before passing fs to Load.
 func RegisterServeFlags(fs *flag.FlagSet) {
-	fs.String("host", "127.0.0.1", "Host to bind to")
-	fs.Int("port", 8080, "Port to listen on")
+	fs.String("host", "127.0.0.1", "Interface/IP for the backend HTTP server to bind")
+	fs.Int("port", 8080, "Port for the backend HTTP server to listen on")
 	fs.String(
 		"public-url", "",
-		"Public URL to trust and open for hostname or proxy access",
+		"Browser URL, also added to trusted origins; does not bind a listener",
 	)
 	fs.Var(
 		&stringListFlag{},
 		"public-origin",
-		"Trusted browser origin to allow for remote or proxied access (repeatable or comma-separated)",
+		"Trusted origin for Host/Origin checks; does not change the browser URL (repeatable or comma-separated)",
 	)
 	fs.String(
 		"proxy", "",
@@ -1839,11 +2009,11 @@ func RegisterServeFlags(fs *flag.FlagSet) {
 	)
 	fs.String(
 		"proxy-bind-host", "",
-		"Local interface/IP for managed Caddy to bind (default: 0.0.0.0)",
+		"Local interface/IP for managed Caddy to bind (default: 127.0.0.1)",
 	)
 	fs.Int(
 		"public-port", 0,
-		"External port for the public URL in managed Caddy mode (default: 8443)",
+		"Managed Caddy HTTP/HTTPS listener port; also sets the public URL port (default: URL port or 8443)",
 	)
 	fs.String(
 		"tls-cert", "",
@@ -1886,16 +2056,16 @@ func RegisterServeFlags(fs *flag.FlagSet) {
 
 // RegisterServePFlags registers serve-command flags on fs.
 func RegisterServePFlags(fs *pflag.FlagSet) {
-	fs.String("host", "127.0.0.1", "Host to bind to")
-	fs.Int("port", 8080, "Port to listen on")
+	fs.String("host", "127.0.0.1", "Interface/IP for the backend HTTP server to bind")
+	fs.Int("port", 8080, "Port for the backend HTTP server to listen on")
 	fs.String(
 		"public-url", "",
-		"Public URL to trust and open for hostname or proxy access",
+		"Browser URL, also added to trusted origins; does not bind a listener",
 	)
 	fs.Var(
 		&stringListFlag{},
 		"public-origin",
-		"Trusted browser origin to allow for remote or proxied access (repeatable or comma-separated)",
+		"Trusted origin for Host/Origin checks; does not change the browser URL (repeatable or comma-separated)",
 	)
 	fs.String(
 		"proxy", "",
@@ -1907,11 +2077,11 @@ func RegisterServePFlags(fs *pflag.FlagSet) {
 	)
 	fs.String(
 		"proxy-bind-host", "",
-		"Local interface/IP for managed Caddy to bind (default: 0.0.0.0)",
+		"Local interface/IP for managed Caddy to bind (default: 127.0.0.1)",
 	)
 	fs.Int(
 		"public-port", 0,
-		"External port for the public URL in managed Caddy mode (default: 8443)",
+		"Managed Caddy HTTP/HTTPS listener port; also sets the public URL port (default: URL port or 8443)",
 	)
 	fs.String(
 		"tls-cert", "",
@@ -2088,6 +2258,19 @@ func (c *Config) resolveSessionSources() error {
 
 	resolved := make([]SessionSource, 0)
 	rootsByAgent := make(map[parser.AgentType]map[string]rootState, len(c.AgentDirs))
+	metadata := make(map[parser.AgentType]map[string][]string)
+	recordMetadata := func(agent parser.AgentType, canonical, metadataDir string) {
+		if metadataDir == "" {
+			return
+		}
+		if metadata[agent] == nil {
+			metadata[agent] = make(map[string][]string)
+		}
+		if slices.Contains(metadata[agent][canonical], metadataDir) {
+			return
+		}
+		metadata[agent][canonical] = append(metadata[agent][canonical], metadataDir)
+	}
 	for _, def := range parser.Registry {
 		seen := make(map[string]rootState)
 		dirs := make([]string, 0, len(c.AgentDirs[def.Type]))
@@ -2096,15 +2279,21 @@ func (c *Config) resolveSessionSources() error {
 			if value == "" {
 				continue
 			}
+			value, metadataDir, err := normalizeRuntimeSessionRoot(def.Type, value)
+			if err != nil {
+				return fmt.Errorf("resolve %s session source %q: %w", def.Type, rawDir, err)
+			}
 			key, err := sessionSourceComparisonKey(value)
 			if err != nil {
 				return fmt.Errorf(
 					"resolve %s session source %q: %w", def.Type, value, err,
 				)
 			}
-			if _, ok := seen[key]; ok {
+			if existing, ok := seen[key]; ok {
+				recordMetadata(def.Type, existing.dir, metadataDir)
 				continue
 			}
+			recordMetadata(def.Type, value, metadataDir)
 			seen[key] = rootState{
 				dir:     value,
 				machine: c.LocalMachineName,
@@ -2116,6 +2305,50 @@ func (c *Config) resolveSessionSources() error {
 	}
 
 	var problems []string
+	for _, def := range parser.Registry {
+		homes := c.agentHomes[def.Type]
+		if len(homes) == 0 {
+			continue
+		}
+		seen := rootsByAgent[def.Type]
+		if seen == nil {
+			seen = make(map[string]rootState)
+			rootsByAgent[def.Type] = seen
+		}
+		for i, rawHome := range homes {
+			home, err := normalizeAgentHomeDir(rawHome)
+			if err != nil {
+				problems = append(problems,
+					fmt.Sprintf("%s: entry %d: %v", def.HomeConfigKey, i+1, err))
+				continue
+			}
+			for _, rawDir := range AgentHomeDirs(def, home) {
+				dir, metadataDir, err := normalizeRuntimeSessionRoot(def.Type, rawDir)
+				if err != nil {
+					problems = append(problems, fmt.Sprintf("%s: entry %d: %v", def.HomeConfigKey, i+1, err))
+					continue
+				}
+				key, err := sessionSourceComparisonKey(dir)
+				if err != nil {
+					problems = append(problems,
+						fmt.Sprintf("%s: entry %d: %v", def.HomeConfigKey, i+1, err))
+					continue
+				}
+				if existing, duplicate := seen[key]; duplicate {
+					recordMetadata(def.Type, existing.dir, metadataDir)
+					continue
+				}
+				recordMetadata(def.Type, dir, metadataDir)
+				seen[key] = rootState{dir: dir, machine: c.LocalMachineName}
+				c.AgentDirs[def.Type] = append(c.AgentDirs[def.Type], dir)
+			}
+			c.agentDirSource[def.Type] = dirFile
+		}
+	}
+	if len(problems) > 0 {
+		return fmt.Errorf("agent homes: %s", strings.Join(problems, "; "))
+	}
+
 	for i, input := range c.sessionSourceConfigs {
 		entry := i + 1
 		agent := parser.AgentType(strings.TrimSpace(strings.ToLower(input.Agent)))
@@ -2142,7 +2375,7 @@ func (c *Config) resolveSessionSources() error {
 				fmt.Sprintf("entry %d (%s): dir %q is an S3 root; session_sources supports filesystem roots only, so configure S3 through the existing per-agent directory setting", entry, agent, input.Dir))
 			continue
 		}
-		dir, err := normalizeSessionSourceDir(input.Dir)
+		dir, metadataDir, err := normalizeRuntimeSessionRoot(agent, input.Dir)
 		if err != nil {
 			problems = append(problems,
 				fmt.Sprintf("entry %d (%s): %v", entry, agent, err))
@@ -2176,6 +2409,7 @@ func (c *Config) resolveSessionSources() error {
 		}
 		state, duplicate := seen[key]
 		if duplicate {
+			dir = state.dir
 			state.machine = machine
 			seen[key] = state
 		} else {
@@ -2185,6 +2419,7 @@ func (c *Config) resolveSessionSources() error {
 			}
 			c.AgentDirs[agent] = append(c.AgentDirs[agent], dir)
 		}
+		recordMetadata(agent, dir, metadataDir)
 		c.agentDirSource[agent] = dirFile
 		resolved = append(resolved, SessionSource{
 			Agent: agent, Dir: dir, Machine: machine,
@@ -2207,6 +2442,7 @@ func (c *Config) resolveSessionSources() error {
 	}
 	c.SessionSources = resolved
 	c.SourceMachines = sourceMachines
+	c.ProviderMetadata = metadata
 	return nil
 }
 
@@ -2215,6 +2451,34 @@ func sessionSourceComparisonKey(dir string) (string, error) {
 		return dir, nil
 	}
 	return pathutil.LocalComparisonKey(dir)
+}
+
+// Runtime scan roots are canonical absolute paths. The original home's
+// absolute path is kept separately for sidecars when only its session
+// directory is linked into another home.
+func normalizeRuntimeSessionRoot(agent parser.AgentType, raw string) (dir, metadataDir string, err error) {
+	if strings.HasPrefix(strings.ToLower(raw), "s3://") {
+		return raw, "", nil
+	}
+	expanded, err := normalizeSessionSourceDir(raw)
+	if err != nil {
+		return "", "", err
+	}
+	return parser.ResolveProviderRoot(agent, expanded)
+}
+
+// normalizeAgentHomeDir validates and expands one alternate agent home.
+// Homes are local directories only: the derived session roots must be
+// watched and read through the filesystem provider paths.
+func normalizeAgentHomeDir(raw string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", fmt.Errorf("home is required")
+	}
+	if strings.HasPrefix(strings.ToLower(value), "s3://") {
+		return "", fmt.Errorf("home %q is an S3 root; homes must be local directories, so configure S3 through the per-agent directory setting", raw)
+	}
+	return normalizeSessionSourceDir(value)
 }
 
 func normalizeSessionSourceDir(raw string) (string, error) {
@@ -2247,6 +2511,12 @@ func resolvePublicURL(value string, proxyCfg ProxyConfig) (string, error) {
 	}
 	if u == nil || u.Host == "" {
 		return "", fmt.Errorf("%q must include a host", value)
+	}
+	if ip := net.ParseIP(u.Hostname()); ip != nil && ip.IsUnspecified() {
+		return "", fmt.Errorf(
+			"%q uses a wildcard bind address; use a hostname or IP reachable by the browser for public_url, and set --host or --proxy-bind-host to choose the listening interface",
+			value,
+		)
 	}
 	if u.User != nil {
 		return "", fmt.Errorf("%q must not include user info", value)
@@ -3007,13 +3277,46 @@ func (c *Config) SaveSettings(patch map[string]any) error {
 		}
 		patch["disabled_agents"] = normalized
 	}
+	var agentHomes map[parser.AgentType][]string
+	if value, ok := patch["agent_homes"]; ok {
+		homes, ok := value.(map[parser.AgentType][]string)
+		if !ok {
+			return fmt.Errorf(
+				"agent_homes must use typed session provider values",
+			)
+		}
+		raw := make(map[string][]string, len(homes))
+		for agent, dirs := range homes {
+			raw[string(agent)] = dirs
+		}
+		normalized, err := NormalizeAgentHomes(raw)
+		if err != nil {
+			return err
+		}
+		agentHomes = normalized
+		delete(patch, "agent_homes")
+		for agent, dirs := range normalized {
+			def, _ := parser.AgentByType(agent)
+			if len(dirs) == 0 {
+				patch[def.HomeConfigKey] = nil
+				continue
+			}
+			patch[def.HomeConfigKey] = dirs
+		}
+	}
 	return c.withConfigLock(func() error {
 		existing, err := c.readConfigMap()
 		if err != nil {
 			return fmt.Errorf("reading config file: %w", err)
 		}
 
-		maps.Copy(existing, patch)
+		for key, value := range patch {
+			if value == nil {
+				delete(existing, key)
+				continue
+			}
+			existing[key] = value
+		}
 
 		// When require_auth is written, remove the legacy
 		// remote_access key so it cannot override on next load.
@@ -3065,6 +3368,16 @@ func (c *Config) SaveSettings(patch map[string]any) error {
 			if agents, ok := v.([]parser.AgentType); ok {
 				c.DisabledAgents = append([]parser.AgentType(nil), agents...)
 			}
+		}
+		for agent, dirs := range agentHomes {
+			if c.agentHomes == nil {
+				c.agentHomes = make(map[parser.AgentType][]string)
+			}
+			if len(dirs) == 0 {
+				delete(c.agentHomes, agent)
+				continue
+			}
+			c.agentHomes[agent] = append([]string(nil), dirs...)
 		}
 		return nil
 	})

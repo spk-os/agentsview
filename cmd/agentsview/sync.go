@@ -1,5 +1,5 @@
 // ABOUTME: CLI subcommand that syncs session data into the database
-// ABOUTME: without starting the HTTP server.
+// ABOUTME: through the shared daemon or an explicit offline run.
 package main
 
 import (
@@ -105,6 +105,10 @@ func doSync(cfg SyncConfig) (hadRemoteFailures bool) {
 		}
 		if tr.Mode == transportHTTP {
 			useDaemon := useDaemonForSync(tr)
+			if useDaemon {
+				fmt.Printf("Server: %s\n", tr.URL)
+				fmt.Println("  Remains running after sync; stop with `agentsview daemon stop`.")
+			}
 			if useDaemon && len(remoteHosts) > 0 {
 				fmt.Println("Running sync with remotes via daemon...")
 				progress := newRemoteProgressPrinter(os.Stdout, time.Now)
@@ -866,6 +870,9 @@ func runLocalSyncAuthoritative(
 	if !stats.AuthoritativeDiscoveryComplete() {
 		return didResync, errors.New("local sync discovery incomplete")
 	}
+	if !stats.ProcessingComplete() {
+		return didResync, errors.New("local sync processing incomplete")
+	}
 	return didResync, nil
 }
 
@@ -966,6 +973,7 @@ func coordinateLocalSync(
 	engine := sync.NewEngine(database, sync.EngineConfig{
 		AgentDirs:               appCfg.AgentDirs,
 		SourceMachines:          appCfg.SourceMachines,
+		ProviderMetadata:        appCfg.ProviderMetadata,
 		DisabledAgents:          appCfg.DisabledAgents,
 		IncludeCwdPrefixes:      appCfg.SyncIncludeCwdPrefixes,
 		ScanProtectedPaths:      appCfg.ScanProtectedPaths,
@@ -994,6 +1002,9 @@ func coordinateLocalSync(
 			return didResync, stats, ctxErr
 		}
 		return didResync, stats, errUnifiedRebuildAborted
+	}
+	if !stats.ProcessingComplete() {
+		return didResync, stats, errors.New("local sync processing incomplete")
 	}
 	return didResync, stats, nil
 }
@@ -1029,7 +1040,7 @@ func runDaemonSync(
 	full bool,
 	onProgress sync.ProgressFunc,
 ) (sync.SyncStats, error) {
-	endpoint := "/api/v1/sync"
+	endpoint := "/api/v1/sync?wait=true"
 	if full {
 		endpoint = "/api/v1/resync"
 	}

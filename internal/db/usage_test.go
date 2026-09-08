@@ -6,8 +6,6 @@ import (
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"fmt"
-	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -26,6 +24,18 @@ import (
 	"go.kenn.io/agentsview/internal/parsertest"
 	pricingpkg "go.kenn.io/agentsview/internal/pricing"
 )
+
+func TestPaddedUTCBoundClampsBeforeYearOne(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t,
+		"0001-01-01T00:00:00Z",
+		paddedUTCBound("0001-01-01T00:00:00Z", -14),
+	)
+	assert.Equal(t,
+		"2026-03-10T10:00:00Z",
+		paddedUTCBound("2026-03-11T00:00:00Z", -14),
+	)
+}
 
 func TestDailyUsageAmountsPricingBandRequestScope(t *testing.T) {
 	tests := []struct {
@@ -50,6 +60,17 @@ func TestDailyUsageAmountsPricingBandRequestScope(t *testing.T) {
 		{
 			name:        "Goose request uses band without message ordinal",
 			usageSource: "goose-request",
+			wantCost:    600_000,
+			wantApplication: export.PricingApplication{
+				Bands: []export.AppliedPricingBand{{
+					AboveInputTokens: 200_000,
+					RequestCount:     1,
+				}},
+			},
+		},
+		{
+			name:        "Posit Assistant sidecar event uses band without message ordinal",
+			usageSource: "posit-assistant-keepalive",
 			wantCost:    600_000,
 			wantApplication: export.PricingApplication{
 				Bands: []export.AppliedPricingBand{{
@@ -301,7 +322,7 @@ func buildDailyUsageFixtureTemplate(t *testing.T) (string, string) {
 	dir, err := os.MkdirTemp("", "agentsview-daily-usage-*")
 	require.NoError(t, err, "create daily usage fixture dir")
 	path := filepath.Join(dir, "test.db")
-	require.NoError(t, copyTestDBTemplate(path),
+	require.NoError(t, copyTestDBTemplate(t, path),
 		"copy base db template for daily usage fixture")
 
 	d, err := OpenPreparedTestDB(path)
@@ -500,6 +521,7 @@ func TestUsageEventsReplaceAndList(t *testing.T) {
 		MessageOrdinal:           &ordinal,
 		Source:                   "session",
 		Model:                    "gpt-5.4",
+		ProviderID:               "positai",
 		InputTokens:              100,
 		OutputTokens:             50,
 		CacheCreationInputTokens: 7,
@@ -527,6 +549,7 @@ func TestUsageEventsReplaceAndList(t *testing.T) {
 		"CacheReadInputTokens (token fields not round-tripped: %#v)", got[0])
 	require.Equal(t, 13, got[0].ReasoningTokens,
 		"ReasoningTokens (token fields not round-tripped: %#v)", got[0])
+	require.Equal(t, "positai", got[0].ProviderID, "ProviderID")
 	require.NotNil(t, got[0].MessageOrdinal, "MessageOrdinal want 3")
 	require.Equal(t, 3, *got[0].MessageOrdinal, "MessageOrdinal")
 	require.NotNil(t, got[0].Cost, "Cost want %v", cost)
@@ -690,7 +713,7 @@ func TestUsagePreservesSessionSummaryUsageEventTokens(t *testing.T) {
 	rawOutput := MaxPlausibleTokens + 500_000
 
 	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
-		ModelPattern:  "gpt-5.4",
+		ModelPattern:  "session-summary-model",
 		InputPerMTok:  money.MustParseDollars("1.0"),
 		OutputPerMTok: money.MustParseDollars("2.0"),
 	}}), "UpsertModelPricing")
@@ -709,7 +732,7 @@ func TestUsagePreservesSessionSummaryUsageEventTokens(t *testing.T) {
 		[]UsageEvent{{
 			SessionID:    "hermes:summary",
 			Source:       "session",
-			Model:        "gpt-5.4",
+			Model:        "session-summary-model",
 			InputTokens:  rawInput,
 			OutputTokens: rawOutput,
 			OccurredAt:   "2026-05-14T10:05:00Z",
@@ -745,7 +768,7 @@ func TestGetDailyUsageFallsBackForEmptyMessageTimestamp(t *testing.T) {
 	ctx := context.Background()
 
 	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
-		ModelPattern:  "claude-sonnet-4-20250514",
+		ModelPattern:  "gpt-5.6-luna",
 		InputPerMTok:  money.MustParseDollars("3.0"),
 		OutputPerMTok: money.MustParseDollars("15.0"),
 	}}), "UpsertModelPricing")
@@ -759,7 +782,7 @@ func TestGetDailyUsageFallsBackForEmptyMessageTimestamp(t *testing.T) {
 		Ordinal:   0,
 		Role:      "assistant",
 		Timestamp: "",
-		Model:     "claude-sonnet-4-20250514",
+		Model:     "gpt-5.6-luna",
 		TokenUsage: jsontext.Value(
 			`{"input_tokens":1000,"output_tokens":500}`,
 		),
@@ -775,6 +798,9 @@ func TestGetDailyUsageFallsBackForEmptyMessageTimestamp(t *testing.T) {
 	assert.Equal(t, "2024-06-15", result.Daily[0].Date, "Date")
 	assert.Equal(t, 1000, result.Totals.InputTokens, "InputTokens")
 	assert.Equal(t, 500, result.Totals.OutputTokens, "OutputTokens")
+	assert.Equal(t, money.MustParseDollars("0.0105"),
+		result.Totals.TotalCost,
+		"untimed usage must use the flat fallback, not the session start date")
 }
 
 func TestBoundedUsagePreservesMalformedTimestampDateFallbackBeforeSnapshotRanking(
@@ -1121,22 +1147,21 @@ func TestInsertCursorUsageEventsDedupesAtPostgresTimestampPrecision(t *testing.T
 // TestGetDailyUsage_CacheSavingsUsesPerModelRates pins down
 // that totals.CacheSavings is computed from each row's actual
 // per-model pricing, not a hard-coded proxy. A hard-coded
-// Sonnet rate would misreport an Opus-heavy workload because
-// Opus rates are roughly 5x Sonnet on both sides.
+// standard rate would misreport a premium-rate workload.
 func TestGetDailyUsage_CacheSavingsUsesPerModelRates(t *testing.T) {
 	d := testDB(t)
 	ctx := context.Background()
 
 	requireNoError(t, d.UpsertModelPricing([]ModelPricing{
 		{
-			ModelPattern:         "claude-opus-4-6",
+			ModelPattern:         "premium-cache-model",
 			InputPerMTok:         money.MustParseDollars("15.0"),
 			OutputPerMTok:        money.MustParseDollars("75.0"),
 			CacheCreationPerMTok: money.MustParseDollars("18.75"),
 			CacheReadPerMTok:     money.MustParseDollars("1.50"),
 		},
 		{
-			ModelPattern:         "claude-sonnet-4-20250514",
+			ModelPattern:         "standard-cache-model",
 			InputPerMTok:         money.MustParseDollars("3.0"),
 			OutputPerMTok:        money.MustParseDollars("15.0"),
 			CacheCreationPerMTok: money.MustParseDollars("3.75"),
@@ -1159,7 +1184,7 @@ func TestGetDailyUsage_CacheSavingsUsesPerModelRates(t *testing.T) {
 	insertMessages(t, d, Message{
 		SessionID: "s-opus", Ordinal: 0,
 		Role: "assistant", Timestamp: "2024-06-15T10:30:00Z",
-		Model: "claude-opus-4-6", TokenUsage: tokens,
+		Model: "premium-cache-model", TokenUsage: tokens,
 	})
 
 	insertSession(t, d, "s-sonnet", "proj", func(s *Session) {
@@ -1169,7 +1194,7 @@ func TestGetDailyUsage_CacheSavingsUsesPerModelRates(t *testing.T) {
 	insertMessages(t, d, Message{
 		SessionID: "s-sonnet", Ordinal: 0,
 		Role: "assistant", Timestamp: "2024-06-15T10:35:00Z",
-		Model: "claude-sonnet-4-20250514", TokenUsage: tokens,
+		Model: "standard-cache-model", TokenUsage: tokens,
 	})
 
 	result, err := d.GetDailyUsage(ctx, UsageFilter{
@@ -1177,24 +1202,190 @@ func TestGetDailyUsage_CacheSavingsUsesPerModelRates(t *testing.T) {
 	})
 	requireNoError(t, err, "GetDailyUsage")
 
-	// Opus per-token delta: read earns (15 - 1.50) = 13.50,
+	// Premium per-token delta: read earns (15 - 1.50) = 13.50,
 	// creation earns (15 - 18.75) = -3.75.
-	// Opus savings on 1M + 1M = 13.50 + (-3.75) = 9.75.
-	// Sonnet per-token delta: read earns (3 - 0.30) = 2.70,
+	// Premium savings on 1M + 1M = 13.50 + (-3.75) = 9.75.
+	// Standard per-token delta: read earns (3 - 0.30) = 2.70,
 	// creation earns (3 - 3.75) = -0.75.
-	// Sonnet savings on 1M + 1M = 2.70 + (-0.75) = 1.95.
+	// Standard savings on 1M + 1M = 2.70 + (-0.75) = 1.95.
 	// Net total savings = 9.75 + 1.95 = 11.70.
 	wantSavings := money.MustParseDollars("11.70")
 	assert.Equal(t, wantSavings, result.Totals.CacheSavings,
 		"Totals.CacheSavings")
 
-	// Falsification: if the code had used Sonnet rates for
+	// Falsification: if the code had used standard rates for
 	// both rows the total would be 2 * 1.95 = 3.90, which
 	// differs from wantSavings by >$7. Assert we're nowhere
 	// near that value so a regression to a single-rate path
 	// trips the test.
 	assert.NotEqual(t, money.MustParseDollars("3.90"), result.Totals.CacheSavings,
 		"CacheSavings looks like single-rate path; expected per-model math")
+}
+
+// TestGetDailyUsage_Claude1hCacheWritesUseThe1hRate replays issue #1452's
+// sample session: Claude Code persists a nested cache_creation TTL split,
+// and 1h writes bill at the 1h rate (2x input), not the 5m rate.
+func TestGetDailyUsage_Claude1hCacheWritesUseThe1hRate(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
+		ModelPattern:           "claude-fable-5",
+		InputPerMTok:           money.MustParseDollars("10.0"),
+		OutputPerMTok:          money.MustParseDollars("50.0"),
+		CacheCreationPerMTok:   money.MustParseDollars("12.50"),
+		CacheCreation1hPerMTok: money.MustParseDollars("20.0"),
+		CacheReadPerMTok:       money.MustParseDollars("1.00"),
+	}}), "UpsertModelPricing")
+
+	insertSession(t, d, "s-1h", "proj", func(s *Session) {
+		s.Agent = "claude"
+		s.StartedAt = new("2026-08-13T11:59:00Z")
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "s-1h", Ordinal: 0,
+			Role: "assistant", Timestamp: "2026-08-13T12:00:05Z",
+			Model: "claude-fable-5",
+			TokenUsage: jsontext.Value(
+				`{"input_tokens":2,"output_tokens":62,` +
+					`"cache_creation_input_tokens":8989,` +
+					`"cache_read_input_tokens":15892,` +
+					`"cache_creation":{"ephemeral_1h_input_tokens":8989,` +
+					`"ephemeral_5m_input_tokens":0}}`),
+		},
+		Message{
+			SessionID: "s-1h", Ordinal: 1,
+			Role: "assistant", Timestamp: "2026-08-13T12:01:00Z",
+			Model: "claude-fable-5",
+			TokenUsage: jsontext.Value(
+				`{"input_tokens":2,"output_tokens":6,` +
+					`"cache_creation_input_tokens":77,` +
+					`"cache_read_input_tokens":24881,` +
+					`"cache_creation":{"ephemeral_1h_input_tokens":77,` +
+					`"ephemeral_5m_input_tokens":0}}`),
+		},
+	)
+
+	result, err := d.GetDailyUsage(ctx, UsageFilter{
+		From: "2026-08-01", To: "2026-08-31",
+	})
+	requireNoError(t, err, "GetDailyUsage")
+
+	// Request 1: 2x10 + 62x50 + 8989x20 + 15892x1 = $0.198792.
+	// Request 2: 2x10 + 6x50 + 77x20 + 24881x1 = $0.026741.
+	// Total matches Claude Code's own total_cost_usd: $0.225533.
+	assert.Equal(t, money.Money{Microdollars: 225_533},
+		result.Totals.TotalCost, "Totals.TotalCost")
+	// The 5m-rate misprice would read $0.157539; make sure a regression
+	// to the flat rate cannot pass.
+	assert.NotEqual(t, money.Money{Microdollars: 157_539},
+		result.Totals.TotalCost,
+		"cost matches the 5m rate; 1h writes must bill at the 1h rate")
+
+	usage, err := d.GetSessionUsage(ctx, "s-1h", false)
+	requireNoError(t, err, "GetSessionUsage")
+	assert.Equal(t, money.Money{Microdollars: 225_533}, usage.Cost,
+		"per-session cost")
+}
+
+// TestGetDailyUsage_1hCacheWritesSurviveTheExceptionTier shares one Claude
+// message/request identity across two sessions so the dedup group cannot be
+// finalized into daily rollups and must resolve through the
+// usage_rollup_exceptions tier. The surviving fact still bills its 1h
+// cache-write subset at the 1h rate.
+func TestGetDailyUsage_1hCacheWritesSurviveTheExceptionTier(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
+		ModelPattern:           "claude-fable-5",
+		InputPerMTok:           money.MustParseDollars("10.0"),
+		OutputPerMTok:          money.MustParseDollars("50.0"),
+		CacheCreationPerMTok:   money.MustParseDollars("12.50"),
+		CacheCreation1hPerMTok: money.MustParseDollars("20.0"),
+		CacheReadPerMTok:       money.MustParseDollars("1.00"),
+	}}), "UpsertModelPricing")
+
+	usage := jsontext.Value(
+		`{"input_tokens":2,"output_tokens":62,` +
+			`"cache_creation_input_tokens":8989,` +
+			`"cache_read_input_tokens":15892,` +
+			`"cache_creation":{"ephemeral_1h_input_tokens":8989,` +
+			`"ephemeral_5m_input_tokens":0}}`)
+	for i, id := range []string{"s-exc-a", "s-exc-b"} {
+		insertSession(t, d, id, "proj", func(s *Session) {
+			s.Agent = "claude"
+			s.StartedAt = new("2026-08-13T11:59:00Z")
+		})
+		insertMessages(t, d, Message{
+			SessionID: id, Ordinal: 0,
+			Role: "assistant", Timestamp: "2026-08-13T12:00:05Z",
+			Model: "claude-fable-5", TokenUsage: usage,
+			ClaudeMessageID: "shared-1h-message",
+			ClaudeRequestID: "shared-1h-request",
+		})
+		_ = i
+	}
+
+	result, err := d.GetDailyUsage(ctx, UsageFilter{
+		From: "2026-08-01", To: "2026-08-31",
+	})
+	requireNoError(t, err, "GetDailyUsage")
+
+	// The replayed snapshot dedups to one billed request:
+	// 2x10 + 62x50 + 8989x20 + 15892x1 = $0.198792.
+	assert.Equal(t, money.Money{Microdollars: 198_792},
+		result.Totals.TotalCost, "Totals.TotalCost")
+	assert.NotEqual(t, money.Money{Microdollars: 131_375},
+		result.Totals.TotalCost,
+		"cost matches the 5m rate; exception-tier facts lost the 1h split")
+}
+
+// TestGetDailyUsage_MixedTTLCacheWritesSplitTheRates prices each TTL
+// portion of one request at its own rate.
+func TestGetDailyUsage_MixedTTLCacheWritesSplitTheRates(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
+		ModelPattern:           "claude-fable-5",
+		InputPerMTok:           money.MustParseDollars("10.0"),
+		OutputPerMTok:          money.MustParseDollars("50.0"),
+		CacheCreationPerMTok:   money.MustParseDollars("12.50"),
+		CacheCreation1hPerMTok: money.MustParseDollars("20.0"),
+		CacheReadPerMTok:       money.MustParseDollars("1.00"),
+	}}), "UpsertModelPricing")
+
+	insertSession(t, d, "s-mixed", "proj", func(s *Session) {
+		s.Agent = "claude"
+		s.StartedAt = new("2026-08-13T11:59:00Z")
+	})
+	insertMessages(t, d, Message{
+		SessionID: "s-mixed", Ordinal: 0,
+		Role: "assistant", Timestamp: "2026-08-13T12:00:05Z",
+		Model: "claude-fable-5",
+		TokenUsage: jsontext.Value(
+			`{"input_tokens":0,"output_tokens":0,` +
+				`"cache_creation_input_tokens":250000,` +
+				`"cache_read_input_tokens":0,` +
+				`"cache_creation":{"ephemeral_1h_input_tokens":100000,` +
+				`"ephemeral_5m_input_tokens":150000}}`),
+	})
+
+	result, err := d.GetDailyUsage(ctx, UsageFilter{
+		From: "2026-08-01", To: "2026-08-31",
+	})
+	requireNoError(t, err, "GetDailyUsage")
+
+	// 150k x 12.50 + 100k x 20 per MTok = 1.875 + 2.0 = $3.875.
+	assert.Equal(t, money.MustParseDollars("3.875"),
+		result.Totals.TotalCost, "Totals.TotalCost")
+
+	// Savings treat each portion against the input rate:
+	// 5m: (10 - 12.50) x 0.15 = -0.375; 1h: (10 - 20) x 0.1 = -1.0.
+	assert.Equal(t, money.MustParseDollars("-1.375"),
+		result.Totals.CacheSavings, "Totals.CacheSavings")
 }
 
 func TestGetDailyUsageAgentFilter(t *testing.T) {
@@ -1368,7 +1559,7 @@ func TestGetDailyUsageCostsMessageReasoningTokens(t *testing.T) {
 	ctx := context.Background()
 
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
-		ModelPattern:  "gpt-5.4",
+		ModelPattern:  "reasoning-model",
 		InputPerMTok:  money.MustParseDollars("1"),
 		OutputPerMTok: money.MustParseDollars("2"),
 	}}))
@@ -1381,7 +1572,7 @@ func TestGetDailyUsageCostsMessageReasoningTokens(t *testing.T) {
 		Ordinal:   0,
 		Role:      "assistant",
 		Timestamp: "2026-05-14T10:30:00Z",
-		Model:     "gpt-5.4",
+		Model:     "reasoning-model",
 		TokenUsage: jsontext.Value(
 			`{"input_tokens":1000,"output_tokens":0,"reasoning_tokens":500}`),
 	})
@@ -1520,7 +1711,7 @@ func TestUsageAggregationClampsMessageTokenJSON(t *testing.T) {
 	const maxTokens = 2_000_000
 
 	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
-		ModelPattern:         "claude-sonnet-4-20250514",
+		ModelPattern:         "clamped-token-model",
 		InputPerMTok:         money.MustParseDollars("1.0"),
 		OutputPerMTok:        money.MustParseDollars("2.0"),
 		CacheCreationPerMTok: money.MustParseDollars("3.0"),
@@ -1539,7 +1730,7 @@ func TestUsageAggregationClampsMessageTokenJSON(t *testing.T) {
 		SessionID: "sess1", Ordinal: 0,
 		Role:      "assistant",
 		Timestamp: "2024-06-15T10:30:00Z",
-		Model:     "claude-sonnet-4-20250514",
+		Model:     "clamped-token-model",
 		TokenUsage: jsontext.Value(
 			`{"input_tokens":9999999999,` +
 				`"output_tokens":9999999999,` +
@@ -3918,9 +4109,6 @@ func TestExcludeModelFilter(t *testing.T) {
 func BenchmarkGetDailyUsage(b *testing.B) {
 	d := testDB(b)
 	ctx := context.Background()
-	origLog := log.Writer()
-	log.SetOutput(io.Discard)
-	defer log.SetOutput(origLog)
 
 	if err := d.UpsertModelPricing([]ModelPricing{
 		{ModelPattern: "claude-sonnet-4-20250514",
@@ -4003,9 +4191,9 @@ func BenchmarkGetDailyUsage(b *testing.B) {
 	if _, err := d.GetDailyUsage(ctx, filter); err != nil {
 		b.Fatalf("warming GetDailyUsage: %v", err)
 	}
-	// Logs stay discarded through the timed loop: a slow-request log
-	// line interleaving with the benchmark result line corrupts the
-	// bench-gate capture (see silenceBenchLogs in internal/sync).
+	// Logs go through b.Output for the whole benchmark (testDB): a
+	// slow-request log line written straight to stderr would split the
+	// benchmark result line and corrupt the bench-gate capture.
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
@@ -4077,12 +4265,6 @@ func BenchmarkGetDailyUsageSnapshotAutomaticIndexOff(b *testing.B) {
 }
 
 func BenchmarkUsageRollup(b *testing.B) {
-	// Cold sub-benchmarks exceed the slow-request threshold on CI
-	// runners; the resulting log line would interleave with benchmark
-	// result lines and corrupt the bench-gate capture.
-	origLog := log.Writer()
-	log.SetOutput(io.Discard)
-	b.Cleanup(func() { log.SetOutput(origLog) })
 	database := testDB(b)
 	seedDailyUsageSnapshotBenchmark(b, database)
 	seedLongLivedUsageBenchmark(b, database)
@@ -4437,9 +4619,6 @@ func benchmarkDailyUsageSnapshotWindow(
 // lower-output snapshots across 500 sessions and 60 days.
 func seedDailyUsageSnapshotBenchmark(tb testing.TB, d *DB) {
 	tb.Helper()
-	origLog := log.Writer()
-	log.SetOutput(io.Discard)
-	defer log.SetOutput(origLog)
 
 	require.NoError(tb, d.UpsertModelPricing([]ModelPricing{
 		{ModelPattern: "claude-sonnet-4-20250514",
@@ -5193,14 +5372,14 @@ func TestGetDailyUsage_CopilotAICredits(t *testing.T) {
 
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{
 		{
-			ModelPattern:         "gpt-4",
+			ModelPattern:         "credit-model",
 			InputPerMTok:         money.MustParseDollars("15.0"),
 			OutputPerMTok:        money.MustParseDollars("60.0"),
 			CacheCreationPerMTok: money.MustParseDollars("15.0"),
 			CacheReadPerMTok:     money.MustParseDollars("6.0"),
 		},
 		{
-			ModelPattern:         "claude-opus-4-6",
+			ModelPattern:         "noncredit-model",
 			InputPerMTok:         money.MustParseDollars("3.0"),
 			OutputPerMTok:        money.MustParseDollars("15.0"),
 			CacheCreationPerMTok: money.MustParseDollars("3.75"),
@@ -5221,7 +5400,7 @@ func TestGetDailyUsage_CopilotAICredits(t *testing.T) {
 			name:        "copilot credits computed",
 			sessionID:   "copilot:aicredits",
 			agent:       "copilot",
-			model:       "gpt-4",
+			model:       "credit-model",
 			inputRate:   money.MustParseDollars("15"),
 			outputRate:  money.MustParseDollars("60"),
 			wantCredits: true,
@@ -5230,7 +5409,7 @@ func TestGetDailyUsage_CopilotAICredits(t *testing.T) {
 			name:        "non copilot capability credits computed",
 			sessionID:   "ai-credit-agent:aicredits",
 			agent:       "ai-credit-agent",
-			model:       "gpt-4",
+			model:       "credit-model",
 			inputRate:   money.MustParseDollars("15"),
 			outputRate:  money.MustParseDollars("60"),
 			wantCredits: true,
@@ -5239,7 +5418,7 @@ func TestGetDailyUsage_CopilotAICredits(t *testing.T) {
 			name:       "non copilot has no credits",
 			sessionID:  "claude:nocredits",
 			agent:      "claude-code",
-			model:      "claude-opus-4-6",
+			model:      "noncredit-model",
 			inputRate:  money.MustParseDollars("3"),
 			outputRate: money.MustParseDollars("15"),
 		},
@@ -5579,6 +5758,66 @@ func TestGetDailyUsage_KimiAliasPricing(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestGetDailyUsage_GPTReserveLunaPricing proves Codex Luna Reserve turns
+// that persist gpt-reserve keep that reported name in the pricing block
+// while costing the same as an explicit gpt-5.6-luna row. There is no
+// gpt-reserve catalog key, so a missed mapping yields zero against a
+// priced Luna sibling.
+func TestGetDailyUsage_GPTReserveLunaPricing(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	ts := "2026-09-05T12:00:00Z"
+	tokenUsage := jsontext.Value(`{"input_tokens":1000000,"output_tokens":0}`)
+	for _, fixture := range []struct {
+		id    string
+		model string
+	}{
+		{id: "codex-gpt-reserve", model: pricingpkg.GPTReserveModelName},
+		{id: "codex-gpt-luna", model: pricingpkg.GPT56LunaCanonical},
+	} {
+		insertSession(t, d, fixture.id, "proj", func(s *Session) {
+			s.Agent = "codex"
+			s.StartedAt = new(ts)
+		})
+		insertMessages(t, d, Message{
+			SessionID:  fixture.id,
+			Ordinal:    0,
+			Role:       "assistant",
+			Timestamp:  ts,
+			Model:      fixture.model,
+			TokenUsage: tokenUsage,
+		})
+	}
+
+	luna, err := d.GetDailyUsage(ctx, UsageFilter{
+		From:     "2026-09-05",
+		To:       "2026-09-05",
+		Timezone: "UTC",
+		Model:    pricingpkg.GPT56LunaCanonical,
+	})
+	requireNoError(t, err, "GetDailyUsage luna")
+	assert.NotZero(t, luna.Totals.TotalCost.Microdollars,
+		"explicit Luna usage must be priced")
+	assert.Equal(t, 1_000_000, luna.Totals.InputTokens)
+
+	reserve, err := d.GetDailyUsage(ctx, UsageFilter{
+		From:     "2026-09-05",
+		To:       "2026-09-05",
+		Timezone: "UTC",
+		Model:    pricingpkg.GPTReserveModelName,
+	})
+	requireNoError(t, err, "GetDailyUsage reserve")
+	assert.Equal(t, 1_000_000, reserve.Totals.InputTokens)
+	assert.Equal(t, luna.Totals.TotalCost, reserve.Totals.TotalCost, "TotalCost")
+	require.NotNil(t, reserve.Pricing, "pricing block")
+	require.Contains(t, reserve.Pricing.Models, pricingpkg.GPTReserveModelName)
+	resolutions := reserve.Pricing.Models[pricingpkg.GPTReserveModelName].Resolutions
+	require.Len(t, resolutions, 1)
+	assert.Equal(t, pricingpkg.GPT56LunaCanonical, resolutions[0].PricedModel)
+	assert.NotContains(t, reserve.Pricing.Models, pricingpkg.GPT56LunaCanonical)
 }
 
 // TestGetDailyUsage_KimiDateAliasMixedDaySameModel proves one reported

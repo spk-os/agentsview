@@ -106,6 +106,20 @@ func (db *DB) WaitUsageCacheBackfill(ctx context.Context) error {
 	return err
 }
 
+// restartUsageCacheBackfillIfEnabled resumes the background coverage pass
+// after maintenance stopped it, but only when this process explicitly enabled
+// it (daemon lifecycle). A CLI resync or compaction reopening the archive
+// must not kick off a full background scan on its own.
+func (db *DB) restartUsageCacheBackfillIfEnabled() error {
+	db.usageBackfillMu.Lock()
+	enabled := db.usageBackfillEnabled
+	db.usageBackfillMu.Unlock()
+	if !enabled {
+		return nil
+	}
+	return db.StartUsageCacheBackfill(context.Background())
+}
+
 // StopUsageCacheBackfill cancels and joins the active pass before cache handles
 // are closed.
 func (db *DB) StopUsageCacheBackfill() {
@@ -121,28 +135,23 @@ func (db *DB) StopUsageCacheBackfill() {
 	}
 }
 
+// runUsageCacheBackfill runs one coverage pass. Facts are filled per session
+// from their own archive read snapshot and rollups aggregate only committed
+// facts, so a pass no longer has to be restarted because the archive was
+// written while it ran. Sessions written during the pass are picked up by
+// their own mutation notification.
 func (db *DB) runUsageCacheBackfill(ctx context.Context) error {
-	started := time.Now()
-	var lastErr error
-	for attempt := 1; attempt <= usageFillMaxAttempts; attempt++ {
-		lastErr = db.runUsageCacheBackfillPass(ctx, started)
-		if !errors.Is(lastErr, errUsageCacheSourceChanged) {
-			return lastErr
-		}
-	}
-	return fmt.Errorf(
-		"usage cache backfill could not stabilize after %d attempts: %w",
-		usageFillMaxAttempts, lastErr)
-}
-
-func (db *DB) runUsageCacheBackfillPass(
-	ctx context.Context, started time.Time,
-) error {
 	snapshot, err := db.captureUsageQuery(
 		ctx, UsageFilter{}, usageQueryKindActivity)
 	if err != nil {
 		return err
 	}
+	return db.runUsageCacheBackfillPass(ctx, time.Now(), snapshot)
+}
+
+func (db *DB) runUsageCacheBackfillPass(
+	ctx context.Context, started time.Time, snapshot usageQuerySnapshot,
+) error {
 	cache, release, err := db.usageCache.acquireGeneration(ctx, snapshot.DatabaseID)
 	if err != nil {
 		return err
