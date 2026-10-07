@@ -108,6 +108,9 @@ func (s *Store) BuildActivityReportArtifacts(
 	if err != nil {
 		return activity.CandidateArtifacts{}, fmt.Errorf("aggregating duckdb activity report: %w", err)
 	}
+	if err := s.activityReportMessageCounts(ctx, ids, q, &artifacts); err != nil {
+		return activity.CandidateArtifacts{}, err
+	}
 	duckReportProgress(onProgress, activity.Progress{
 		Phase: activity.ProgressFinalizing, SessionsTotal: len(sessions),
 		SessionsProcessed: len(sessions), RowsProcessed: rowsProcessed,
@@ -135,6 +138,35 @@ func duckReportProgress(callback activity.ProgressFunc, progress activity.Progre
 	if callback != nil {
 		callback(progress)
 	}
+}
+
+func (s *Store) activityReportMessageCounts(
+	ctx context.Context, ids []string, q activity.Query, artifacts *activity.CandidateArtifacts,
+) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	rows, err := s.queryContext(ctx, `
+		SELECT session_id, role, timestamp FROM messages
+		WHERE session_id IN (SELECT unnest(?))
+			AND role IN ('user', 'assistant') AND is_system = false
+			AND COALESCE(source_subtype, '') <> 'tool_result'
+			AND timestamp >= CAST(? AS TIMESTAMP) AND timestamp < CAST(? AS TIMESTAMP)`,
+		ids, q.RangeStart.UTC().Format(time.RFC3339Nano), q.EffectiveEnd.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return fmt.Errorf("querying duckdb activity message counts: %w", err)
+	}
+	defer rows.Close()
+	counts := activity.NewMessageAccumulator(q, artifacts)
+	for rows.Next() {
+		var sessionID, role string
+		var timestamp time.Time
+		if err := rows.Scan(&sessionID, &role, &timestamp); err != nil {
+			return fmt.Errorf("scanning duckdb activity message counts: %w", err)
+		}
+		counts.Add(sessionID, role, timestamp)
+	}
+	return rows.Err()
 }
 
 // GetSessionUsageRows returns the backend-priced usage rows for the supplied
@@ -293,21 +325,18 @@ func (s *Store) GetSessionUsageRows(
 			o.scan.webSearchRequests)
 		rawOutputTokensBySession[o.scan.sessionID] += o.scan.outputTok
 	}
-	canonicalTokenCoverageBySession, err :=
-		activity.CanonicalSessionTokenCoverageContext(ctx, snapshotRows)
+	canonicalTokenCoverageBySession, err := activity.CanonicalSessionTokenCoverageContext(ctx, snapshotRows)
 	if err != nil {
 		return nil, err
 	}
-	snapshotMask, snapshotAttribution, snapshotWebSearchRequests :=
-		activity.ClaudeSnapshotSurvivorSelection(snapshotRows)
+	snapshotMask, snapshotAttribution, snapshotWebSearchRequests := activity.ClaudeSnapshotSurvivorSelection(snapshotRows)
 	seen := make(map[string]struct{})
 	deduplicatedOutputTokens := make(map[string]int)
 	discardedContributingSessions := make(map[string]struct{})
 	out := make([]activity.UsageRow, 0, len(rowsAcc))
 	for i, o := range rowsAcc {
 		if !snapshotMask[i] {
-			deduplicatedOutputTokens[o.scan.sessionID] +=
-				snapshotRows[i].OutputTokens
+			deduplicatedOutputTokens[o.scan.sessionID] += snapshotRows[i].OutputTokens
 			if rowContributes[i] {
 				discardedContributingSessions[o.scan.sessionID] = struct{}{}
 			}
@@ -332,8 +361,7 @@ func (s *Store) GetSessionUsageRows(
 			}
 			seen[key] = struct{}{}
 		}
-		cost, costSource, priced, contributes, sessionCost, priceErr :=
-			duckActivityUsageCost(r, rateResolver)
+		cost, costSource, priced, contributes, sessionCost, priceErr := duckActivityUsageCost(r, rateResolver)
 		if priceErr != nil {
 			return nil, priceErr
 		}
@@ -463,7 +491,8 @@ func (s *Store) activityReportSessions(
 		s.machine,
 		s.started_at,
 		s.ended_at,
-		COALESCE(s.is_automated, false) AS is_automated
+		COALESCE(s.is_automated, false) AS is_automated,
+		s.relationship_type = 'subagent' AS is_subagent
 	FROM sessions s
 	WHERE ` + where
 
@@ -481,7 +510,7 @@ func (s *Store) activityReportSessions(
 		var startedAt, endedAt any
 		if err := rows.Scan(
 			&m.SessionID, &m.Title, &m.Project, &m.Agent,
-			&m.Machine, &startedAt, &endedAt, &m.IsAutomated,
+			&m.Machine, &startedAt, &endedAt, &m.IsAutomated, &m.IsSubagent,
 		); err != nil {
 			return nil, nil, fmt.Errorf(
 				"scanning duckdb activity report session: %w", err)
@@ -689,6 +718,7 @@ func (s *Store) activityReportCandidateSource(
 		if err != nil {
 			return fmt.Errorf("querying duckdb activity report terminal candidates: %w", err)
 		}
+		defer terminalRows.Close()
 		var terminal []activity.IntervalCandidate
 		for terminalRows.Next() {
 			candidate, scanErr := scanCandidate(terminalRows)
@@ -921,10 +951,9 @@ func (s *Store) activityReportUsage(
 	for i, o := range rowsAcc {
 		baseRows[i] = o.row
 	}
-	mask, attribution, webSearchRequests :=
-		activity.UsageSurvivorSelectionForSessions(
-			q.RangeStart, q.RangeEnd, q.EffectiveEnd, baseRows, ids,
-		)
+	mask, attribution, webSearchRequests := activity.UsageSurvivorSelectionForSessions(
+		q.RangeStart, q.RangeEnd, q.EffectiveEnd, baseRows, ids,
+	)
 	out = make([]activity.UsageRow, 0, len(rowsAcc))
 	for i, o := range rowsAcc {
 		if !mask[i] {
@@ -932,8 +961,7 @@ func (s *Store) activityReportUsage(
 		}
 		costRow := o.scan
 		costRow.webSearchRequests = webSearchRequests[i]
-		cost, costSource, priced, contributes, sessionCost, priceErr :=
-			duckActivityUsageCost(costRow, rateResolver)
+		cost, costSource, priced, contributes, sessionCost, priceErr := duckActivityUsageCost(costRow, rateResolver)
 		if priceErr != nil {
 			return nil, nil, priceErr
 		}
@@ -1182,7 +1210,8 @@ func duckActivityUsageHasOrdinal(v any) bool {
 func duckActivityUsageCost(
 	r duckActivityReportUsageRow, pricing *export.PricingResolver,
 ) (cost money.Money, costSource export.CostSource, priced, contributes bool,
-	sessionCost *money.Money, err error) {
+	sessionCost *money.Money, err error,
+) {
 	costRow := r
 	if r.costSource == db.CopilotReportedCostSource && r.cost != nil {
 		v := money.Money{Microdollars: *r.cost}
@@ -1190,8 +1219,7 @@ func duckActivityUsageCost(
 		costRow.cost = nil
 		pricing.RecordUnattributedReported()
 	}
-	_, cost, priced, contributes, err =
-		duckActivityReportRowStatus(costRow, pricing)
+	_, cost, priced, contributes, err = duckActivityReportRowStatus(costRow, pricing)
 	costSource = export.CostSourceComputed
 	if costRow.cost != nil {
 		costSource = export.CostSourceReported

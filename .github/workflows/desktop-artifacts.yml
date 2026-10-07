@@ -1,8 +1,13 @@
 name: Desktop Artifacts
 
+env:
+  # "|" falls back to direct on any proxy error (e.g. HTTP/2 INTERNAL_ERROR), not just 404/410.
+  GOPROXY: "https://proxy.golang.org|direct"
+
 on:
   workflow_call:
-  # Linux builds use the managed public fleet for main and same-repository PRs.
+  workflow_dispatch:
+  # Linux AMD64 and Windows builds use Namespace for pushes and all PRs.
   # macOS builds live in desktop-macos-main.yml.
   push:
     branches: [main]
@@ -23,19 +28,19 @@ concurrency:
 jobs:
   build:
     name: Desktop Build (${{ matrix.name }})
-    runs-on: ${{ contains(fromJSON('["ubuntu-latest","ubuntu-24.04","ubuntu-22.04"]'), matrix.os) && github.repository == 'kenn-io/agentsview' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository)) && 'kenn-linux-x64-public' || matrix.os }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: Windows
-            os: windows-latest
+            os: namespace-profile-windows-8cpu
             bundle: nsis
             target_triple: ""
             artifact_name: agentsview-desktop-windows
             artifact_dir: desktop/src-tauri/target/release/bundle/nsis/
           - name: Linux
-            os: ubuntu-22.04
+            os: namespace-profile-linux-8cpu
             bundle: appimage
             target_triple: ""
             artifact_name: agentsview-desktop-linux
@@ -53,6 +58,7 @@ jobs:
 
       - uses: ./.github/actions/build-desktop-artifact
         with:
+          namespace-cache: ${{ matrix.name != 'Linux (arm64)' }}
           bundle: ${{ matrix.bundle }}
           target_triple: ${{ matrix.target_triple }}
           artifact_name: ${{ matrix.artifact_name }}

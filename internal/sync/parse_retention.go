@@ -13,16 +13,25 @@ import (
 
 const (
 	defaultParseRetentionBytes = int64(64 << 20)
-	// Keep all eight workers available for the roughly 6 MiB sources that
-	// exposed bulk-sync throttling under the four-times-source-size estimate.
-	// Together with the pending-result limit, the two explicit pipeline bounds
-	// total 768 MiB.
+	// Keep all eight workers available for roughly 6 MiB sources under the
+	// four-times-source-size estimate. Active parses and pending writes have
+	// nominal budgets totaling 384 MiB. An indivisible oversized or unknown
+	// source may exceed the pending budget before its standalone batch is
+	// written; these estimates are not a hard heap limit.
 	defaultBulkParseRetentionBytes   = int64(256 << 20)
-	defaultBulkPendingRetentionBytes = int64(512 << 20)
+	defaultBulkPendingRetentionBytes = int64(128 << 20)
 	parseRetentionFixedBytes         = int64(64 << 10)
 	parseRetentionMultiplier         = int64(4)
 	parseRetentionScavengeThreshold  = int64(16 << 20)
+	// Bound pending daemon writes by source bytes as well as session count.
+	parseBatchBytesLimit = defaultParseRetentionBytes
 )
+
+// bulkPendingRetentionBytes is the pending-result budget each new bulk budget
+// receives. It is a variable only so benchmarks can compare budgets over the
+// same fixture; rebuild contributor engines construct their own budgets, so a
+// per-engine field would not reach them.
+var bulkPendingRetentionBytes = defaultBulkPendingRetentionBytes
 
 type parseRetentionBudget struct {
 	capacity             int64
@@ -56,7 +65,7 @@ func newParseRetentionBudget(capacity int64) *parseRetentionBudget {
 // budget's large-source threshold.
 func newBulkParseRetentionBudget(capacity int64) *parseRetentionBudget {
 	budget := newParseRetentionBudget(capacity)
-	budget.pendingCapacity = defaultBulkPendingRetentionBytes
+	budget.pendingCapacity = bulkPendingRetentionBytes
 	budget.scavengeEveryAcquire = true
 	return budget
 }
@@ -154,7 +163,15 @@ func releaseParseRetentionLeases(leases []*parseRetentionLease) {
 	}
 }
 
-func parseRetentionSourceBytes(file parser.DiscoveredFile) int64 {
+// parseRetentionSourceBytes estimates the bytes one discovered source
+// contributes to a parse. A shared SQLite container fans into one virtual
+// source per session row and every member stats back to the same container
+// file, so the raw size would charge each member for rows only its siblings
+// hold. Members partition the container, so the container size divided by the
+// sessions this pass discovered in it sums back to the container across the
+// whole membership. An unknown or partial count returns a larger share and
+// therefore admits fewer parses, never more.
+func (e *Engine) parseRetentionSourceBytes(file parser.DiscoveredFile) int64 {
 	if file.SourceSize > 0 {
 		return file.SourceSize
 	}
@@ -164,10 +181,21 @@ func parseRetentionSourceBytes(file parser.DiscoveredFile) int64 {
 			path = providerPath
 		}
 	}
-	path = validatedProviderSourceStatPath(path)
-	info, err := os.Stat(path)
+	info, err := os.Stat(validatedProviderSourceStatPath(path))
 	if err != nil || !info.Mode().IsRegular() {
 		return 0
+	}
+	// Membership follows the same resolved path as the stat: a virtual member
+	// promoted to its storage JSON shadow stats the shadow, so dividing that
+	// size by the container's membership would undercharge the parse.
+	resolved := parser.DiscoveredFile{Agent: file.Agent, Path: path}
+	if members := e.sqliteContainerDiscoveredMembers(resolved); members > 1 {
+		// Sole-member containers keep the raw size so a zero-byte container
+		// still reports zero, which retainedBytes reads as an unknown source.
+		// Above one member the share floors at a byte instead, because a
+		// non-positive estimate would charge the whole budget: the fault this
+		// fixes.
+		return max(info.Size()/int64(members), 1)
 	}
 	return info.Size()
 }

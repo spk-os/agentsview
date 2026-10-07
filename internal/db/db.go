@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	_ "embed"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -16,6 +17,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/cenkalti/backoff/v7"
+	"github.com/mattn/go-sqlite3"
 
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/export"
@@ -462,7 +466,106 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // variant suffixes (-exp-b) against the matching effort-qualified executor
 // model. Existing Antigravity rows need re-parsing so stored messages and
 // usage events reflect the intended effort-qualified model.)
-const dataVersion = 99
+// (100: Codex subagent lineage now uses the structural source marker. Existing
+// guardian rows need re-parsing because a fingerprint change cannot repair
+// byte-identical files.)
+// (101: Cursor user turn timestamps are parsed from recognized metadata.
+// Existing Cursor rows need re-parsing so stored message and session times
+// reflect the transcript timestamps.)
+// (102: Cursor legacy text transcripts now preserve nonempty tool-result
+// bodies as result events. Existing Cursor rows need re-parsing to recover
+// output from unchanged source files.)
+// (103: Copilot assistant output is reported without a shutdown summary.)
+// (104: OpenCode v2 projections, mixed CLI/API history, attachments, and
+// compaction boundaries. Re-parse existing sessions and reconsider skipped
+// sources even when the producer database has not changed.)
+// (105: OpenCode messages record their storage message ID as source_uuid so
+// archive guards match stored rows by identity instead of ordinal, and
+// RooCode, Kilo Legacy, gptme, OpenHands, and Aider rows that carry tool
+// output as message text, along with Cortex tool-result-only rows, are
+// marked with the tool_result source subtype so storage policies can drop it.
+// Existing rows need re-parsing to receive both.)
+// (106: Claude and Codex assistant messages now persist reasoning effort.
+// Existing rows need re-parsing so the field is populated.)
+// (107: Cursor CLI Subagent tool category. Re-parsing maps existing Cursor
+// Subagent tool calls from Other to Task so delegation renders as a task call
+// and leaves the Other analytics bucket; subagent transcripts themselves are
+// new sources and need no re-parse.)
+// (108: OpenCode v2 tool results retain embedded file payloads. Existing
+// sessions need re-parsing to recover files omitted from stored results.)
+// (109: Claude repository-local worktrees. Re-parse existing sessions from
+// REPO/.claude/worktrees/<generated-name> so they use the owning repository
+// rather than the generated worktree name, including unchanged sources
+// already parsed at version 108 by v0.43.0.)
+// (110: Native Pi parentSession paths now resolve to the parent's persisted
+// header ID, and native Pi sessions with a resolved parent are classified as
+// forks. Re-parse stored native Pi sessions to repair lineage edges and fork
+// classification.)
+// (111: Devin message source identities are now session-scoped. Existing
+// Devin rows carry bare node_id/step_id SourceUUIDs that collide across
+// sessions in usage deduplication; a fingerprint change cannot cover this
+// because the source bytes are unchanged, so existing sessions need
+// re-parsing.)
+// (112: Codex `originator=codex_exec` is persisted as session_kind
+// non-interactive so every exec session classifies as automated.
+// `thread_source=roborev` is persisted as session_kind roborev so roborev
+// reviews stay identifiable as code review. Existing Codex-format rows
+// need re-parsing.)
+// (113: Codex injected context is removed per text block before storing
+// messages and classifying user prompts. Re-parse unchanged sources to
+// remove retained context, restore omitted prompts, and correct first-message
+// previews and user-message counts.)
+// (114: Codex `apply_patch` calls record the files named in the patch body,
+// one tool call per file, so file-keyed views such as Recent Edits include
+// them. Re-parse unchanged Codex sources to backfill file_path.)
+// (115: Cursor IDE sessions start at their earliest timestamped bubble;
+// composerData.createdAt is only a fallback for composers without bubble
+// timestamps. Re-parse unchanged state.vscdb containers to correct started_at.)
+// (116: Claude and Amp tool results retain explicit failure/completion status,
+// and Cline results retain image markers. Re-parse unchanged sources to restore
+// outcome evidence lost from summaries.)
+// (117: an Antigravity conversation whose own stream is encrypted is stored
+// from the plaintext transcript its agent brain wrote, and .gemini/antigravity-ide
+// is a default Antigravity root. Re-parse unchanged Antigravity sources so those
+// conversations reach the archive.)
+// (118: Claude custom-title, Qwen custom_title, Copilot user_named, and OpenClaw
+// session labels now become session names, and a Copilot name the user chose no
+// longer replaces the first message. Re-parse unchanged sources so sessions
+// renamed before the upgrade show those names.)
+// (119: Codebuff and Freebuff sessions gain git_branch, termination status,
+// per-prompt cost rows, attachment and ask-user content, and linked subagent
+// sessions. Re-parse unchanged Codebuff/Freebuff sources to backfill them.)
+// (120: each agent's own session title becomes the session name, preferring a
+// name the user chose: generated Qwen and OpenClaw titles, every Copilot
+// workspace name, OpenCode/Kilo/MiMo Code and Amp titles, VS Code customTitle,
+// Kimi state titles, Gemini summaries, and legacy Kiro titles. Titles no longer
+// replace the first message. Re-parse unchanged sources so existing sessions
+// pick up their titles.)
+// (121: Cursor IDE stored hashes carry a composer-document digest ahead of the
+// full content digest, which the watcher compares to skip unchanged
+// composers. The bump reparses the whole archive once, which rewrites every
+// live Cursor IDE row to the new hash; until then the watcher parses the
+// whole container. Trashed rows keep their old hash and are vouched as
+// suppressed.)
+// (122: a Claude sub-agent that ran again under a second parent session has
+// that second transcript's entries appended to the same sub-agent session.
+// Re-parse unchanged Claude sources so a sub-agent session reaches its later
+// run's last entry.)
+// (123: Codex cache-write input tokens are split out of uncached input into
+// cache_creation_input_tokens so GPT-5.6 and later writes price at the
+// cache-write rate. Re-parse unchanged Codex-format sources because the
+// stored token_usage changes while source bytes do not.)
+// (124: OpenCode dispatch timestamps are retained as tool-execution events so
+// unchanged sessions gain dispatch-to-completion timing.)
+// (125: Gemini and Cursor files that share a session ID remain separate
+// conversations. Re-parse unchanged sources, including cached remote mirrors,
+// to recover conversations previously collapsed into one archived session.)
+// (126: Claude messages from another Claude Code session, persisted as
+// queued_command prompts wrapped in <cross-session-message>, are now system
+// rows with source_subtype peer_message instead of user prompts. Re-parse
+// unchanged Claude sources so user-message counts and first messages drop
+// them.)
+const dataVersion = 126
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 
@@ -505,8 +608,8 @@ func (e *DataVersionTooNewError) Error() string {
 
 // IsDataVersionTooNew reports whether err wraps DataVersionTooNewError.
 func IsDataVersionTooNew(err error) bool {
-	var tooNew *DataVersionTooNewError
-	return errors.As(err, &tooNew)
+	_, hasTooNew := errors.AsType[*DataVersionTooNewError](err)
+	return hasTooNew
 }
 
 // ClassifierHashKey is the shared SQLite stats / PG sync_metadata key
@@ -531,6 +634,21 @@ CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
 END;
 `
 
+const cjkFTSRuntimeMatchesSQL = `EXISTS (
+    SELECT 1 FROM main.stats
+    WHERE key = '` + cjkFTSFingerprintStatsKey + `'
+      AND CAST(value AS TEXT) = agentsview_cjk_fts_fingerprint()
+)`
+
+const messagesCJKADTriggerDDL = `
+CREATE TEMP TRIGGER IF NOT EXISTS messages_cjk_ad
+AFTER DELETE ON main.messages
+WHEN ` + cjkFTSRuntimeMatchesSQL + ` BEGIN
+    INSERT INTO messages_cjk_fts(messages_cjk_fts, rowid, content)
+        VALUES('delete', old.id, old.content);
+END;
+`
+
 const schemaFTS = `
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     content,
@@ -547,6 +665,57 @@ CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, content)
         VALUES('delete', old.id, old.content);
     INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+END;
+`
+
+const schemaCJKFTS = `
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_cjk_fts USING fts5(
+    content,
+    content='messages',
+    content_rowid='id',
+    tokenize='simple 0'
+);
+`
+
+const schemaCJKFTSTriggers = `
+CREATE TEMP TRIGGER IF NOT EXISTS messages_cjk_ai
+AFTER INSERT ON main.messages
+WHEN ` + cjkFTSRuntimeMatchesSQL + ` BEGIN
+    INSERT INTO messages_cjk_fts(rowid, content) VALUES (new.id, new.content);
+END;
+` + messagesCJKADTriggerDDL + `
+CREATE TEMP TRIGGER IF NOT EXISTS messages_cjk_au
+AFTER UPDATE ON main.messages
+WHEN ` + cjkFTSRuntimeMatchesSQL + ` BEGIN
+    INSERT INTO messages_cjk_fts(messages_cjk_fts, rowid, content)
+        VALUES('delete', old.id, old.content);
+    INSERT INTO messages_cjk_fts(rowid, content) VALUES (new.id, new.content);
+END;
+
+-- The persistent BEFORE triggers mark a session pending without consulting
+-- the extension, because a build without the sidecar cannot evaluate the
+-- fingerprint function. Match those events exactly and clear only generation
+-- 1, which was created by this write. Higher generations include an earlier
+-- unmaintained write and must survive until the index is rebuilt. The BEFORE
+-- INSERT trigger ignores existing sessions, so an upsert marks at most once.
+CREATE TEMP TRIGGER IF NOT EXISTS sessions_cjk_pending_ai
+AFTER INSERT ON main.sessions
+WHEN ` + cjkFTSRuntimeMatchesSQL + ` BEGIN
+    DELETE FROM messages_cjk_fts_pending_sessions
+    WHERE session_id = new.id AND generation = 1;
+END;
+CREATE TEMP TRIGGER IF NOT EXISTS sessions_cjk_pending_au
+AFTER UPDATE OF transcript_revision ON main.sessions
+WHEN old.transcript_revision IS NOT new.transcript_revision
+ AND ` + cjkFTSRuntimeMatchesSQL + ` BEGIN
+    DELETE FROM messages_cjk_fts_pending_sessions
+    WHERE session_id = new.id AND generation = 1;
+END;
+CREATE TEMP TRIGGER IF NOT EXISTS sessions_cjk_pending_ad
+AFTER DELETE ON main.sessions
+WHEN ` + cjkFTSRuntimeMatchesSQL + ` BEGIN
+    DELETE FROM messages_cjk_fts_pending_sessions
+    WHERE session_id = old.id AND generation = 1;
 END;
 `
 
@@ -576,28 +745,6 @@ CREATE TRIGGER IF NOT EXISTS recall_entries_au AFTER UPDATE ON recall_entries BE
 END;
 `
 
-const recallEntriesFTS4 = `
-CREATE VIRTUAL TABLE IF NOT EXISTS recall_entries_fts USING fts4(
-    title,
-    body,
-    trigger,
-    tokenize=porter
-);
-
-CREATE TRIGGER IF NOT EXISTS recall_entries_ai AFTER INSERT ON recall_entries BEGIN
-    INSERT INTO recall_entries_fts(rowid, title, body, trigger)
-        VALUES (new.rowid, new.title, new.body, new.trigger);
-END;
-CREATE TRIGGER IF NOT EXISTS recall_entries_ad AFTER DELETE ON recall_entries BEGIN
-    DELETE FROM recall_entries_fts WHERE rowid = old.rowid;
-END;
-CREATE TRIGGER IF NOT EXISTS recall_entries_au AFTER UPDATE ON recall_entries BEGIN
-    DELETE FROM recall_entries_fts WHERE rowid = old.rowid;
-    INSERT INTO recall_entries_fts(rowid, title, body, trigger)
-        VALUES (new.rowid, new.title, new.body, new.trigger);
-END;
-`
-
 const recallEvidenceFTS = `
 CREATE VIRTUAL TABLE IF NOT EXISTS recall_evidence_fts USING fts5(
     snippet,
@@ -622,26 +769,6 @@ CREATE TRIGGER IF NOT EXISTS recall_evidence_au AFTER UPDATE ON recall_evidence 
 END;
 `
 
-const recallEvidenceFTS4 = `
-CREATE VIRTUAL TABLE IF NOT EXISTS recall_evidence_fts USING fts4(
-    snippet,
-    tokenize=porter
-);
-
-CREATE TRIGGER IF NOT EXISTS recall_evidence_ai AFTER INSERT ON recall_evidence BEGIN
-    INSERT INTO recall_evidence_fts(rowid, snippet)
-        VALUES (new.id, new.snippet);
-END;
-CREATE TRIGGER IF NOT EXISTS recall_evidence_ad AFTER DELETE ON recall_evidence BEGIN
-    DELETE FROM recall_evidence_fts WHERE rowid = old.id;
-END;
-CREATE TRIGGER IF NOT EXISTS recall_evidence_au AFTER UPDATE ON recall_evidence BEGIN
-    DELETE FROM recall_evidence_fts WHERE rowid = old.id;
-    INSERT INTO recall_evidence_fts(rowid, snippet)
-        VALUES (new.id, new.snippet);
-END;
-`
-
 // DB manages a write connection and a read-only pool.
 // The reader and writer fields use atomic.Pointer so that
 // concurrent HTTP handler goroutines can safely read while
@@ -656,6 +783,7 @@ type DB struct {
 	usageBackfillDone    chan struct{}
 	usageBackfillErr     error
 	usageBackfillStarted func()
+	usageBackfillRerun   bool // queues one more pass after the active one
 	// usageBackfillEnabled records that this process explicitly started
 	// background backfill (the daemon lifecycle). Reopen restarts a pass
 	// only then, so CLI resyncs never trigger an unrequested archive scan.
@@ -669,8 +797,12 @@ type DB struct {
 	// a later close reports success, or write ownership could be released
 	// (or the database file replaced) while a connection still holds the
 	// file. Guarded by connMu.
-	undrainedPools []*sql.DB
-	readOnly       bool
+	undrainedPools   []*sql.DB
+	readOnly         bool
+	toolResultImages config.ToolResultImages
+	assetsDir        string
+	// archiveContent indexes archiveContentRanks; see SetArchiveContent.
+	archiveContent atomic.Int32
 	// writerClosed is set while the writer pool is intentionally closed for a
 	// worker maintenance pass (CloseWriter). It lets write attempts report
 	// ErrWriterClosed instead of the generic read-only error.
@@ -697,18 +829,31 @@ type DB struct {
 	vectorMu       sync.RWMutex
 	vectorSearcher VectorSearcher
 	recallSearcher RecallVectorSearcher
+
+	// messagesLoadCount counts GetAllMessages calls. Tests use it to gate
+	// the incremental signal path: a maintained delta must not load
+	// session history.
+	messagesLoadCount atomic.Int64
+
+	cjkFTSUnavailableLog sync.Once
+}
+
+// MessagesLoadCount returns the total number of GetAllMessages calls the
+// database has served. Monotonic; used by the incremental-path gates.
+func (db *DB) MessagesLoadCount() int64 {
+	return db.messagesLoadCount.Load()
 }
 
 // Reader exposes guarded read-only query operations. It intentionally does
 // not expose the underlying *sql.DB so callers cannot retain a raw pool across
 // Reopen.
 type Reader interface {
-	Exec(query string, args ...any) (sql.Result, error)
-	Query(query string, args ...any) (*sql.Rows, error)
+	Exec(ctx context.Context, query string, args ...any) (sql.Result, error)
+	Query(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 	QueryContext(
 		ctx context.Context, query string, args ...any,
 	) (*sql.Rows, error)
-	QueryRow(query string, args ...any) *sql.Row
+	QueryRow(ctx context.Context, query string, args ...any) *sql.Row
 	QueryRowContext(
 		ctx context.Context, query string, args ...any,
 	) *sql.Row
@@ -732,20 +877,21 @@ func (r *readerHandle) current() *sql.DB {
 	return r.owner.reader.Load()
 }
 
-func (r *readerHandle) Exec(
+func (r *readerHandle) Exec(ctx context.Context,
 	query string, args ...any,
 ) (sql.Result, error) {
 	r.owner.connMu.RLock()
 	defer r.owner.connMu.RUnlock()
-	return r.current().Exec(query, args...)
+	return r.current().ExecContext(ctx, query, args...)
 }
 
-func (r *readerHandle) Query(
+func (r *readerHandle) Query(ctx context.Context,
 	query string, args ...any,
 ) (*sql.Rows, error) {
 	r.owner.connMu.RLock()
 	defer r.owner.connMu.RUnlock()
-	return r.current().Query(query, args...)
+	rows, err := r.current().QueryContext(ctx, query, args...)
+	return rows, err
 }
 
 func (r *readerHandle) QueryContext(
@@ -753,15 +899,16 @@ func (r *readerHandle) QueryContext(
 ) (*sql.Rows, error) {
 	r.owner.connMu.RLock()
 	defer r.owner.connMu.RUnlock()
-	return r.current().QueryContext(ctx, query, args...)
+	rows, err := r.current().QueryContext(ctx, query, args...)
+	return rows, err
 }
 
-func (r *readerHandle) QueryRow(
+func (r *readerHandle) QueryRow(ctx context.Context,
 	query string, args ...any,
 ) *sql.Row {
 	r.owner.connMu.RLock()
 	defer r.owner.connMu.RUnlock()
-	return r.current().QueryRow(query, args...)
+	return r.current().QueryRowContext(ctx, query, args...)
 }
 
 func (r *readerHandle) QueryRowContext(
@@ -804,14 +951,14 @@ func (w *writerHandle) current() (*sql.DB, error) {
 	return db, nil
 }
 
-func (w *writerHandle) Exec(query string, args ...any) (sql.Result, error) {
+func (w *writerHandle) Exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	w.owner.connMu.RLock()
 	defer w.owner.connMu.RUnlock()
 	db, err := w.current()
 	if err != nil {
 		return nil, err
 	}
-	return db.Exec(query, args...)
+	return db.ExecContext(ctx, query, args...)
 }
 
 func (w *writerHandle) ExecContext(
@@ -826,7 +973,7 @@ func (w *writerHandle) ExecContext(
 	return db.ExecContext(ctx, query, args...)
 }
 
-func (w *writerHandle) Query(
+func (w *writerHandle) Query(ctx context.Context,
 	query string, args ...any,
 ) (*sql.Rows, error) {
 	w.owner.connMu.RLock()
@@ -835,7 +982,8 @@ func (w *writerHandle) Query(
 	if err != nil {
 		return nil, err
 	}
-	return db.Query(query, args...)
+	rows, err := db.QueryContext(ctx, query, args...)
+	return rows, err
 }
 
 func (w *writerHandle) QueryContext(
@@ -847,10 +995,11 @@ func (w *writerHandle) QueryContext(
 	if err != nil {
 		return nil, err
 	}
-	return db.QueryContext(ctx, query, args...)
+	rows, err := db.QueryContext(ctx, query, args...)
+	return rows, err
 }
 
-func (w *writerHandle) QueryRow(query string, args ...any) rowScanner {
+func (w *writerHandle) QueryRow(ctx context.Context, query string, args ...any) rowScanner {
 	w.owner.connMu.RLock()
 	defer w.owner.connMu.RUnlock()
 	db, err := w.current()
@@ -859,7 +1008,7 @@ func (w *writerHandle) QueryRow(query string, args ...any) rowScanner {
 	}
 	// The lock protects pool selection, not Scan. database/sql keeps any
 	// row's connection alive if the pool is closed after QueryRow returns.
-	return db.QueryRow(query, args...)
+	return db.QueryRowContext(ctx, query, args...)
 }
 
 func (w *writerHandle) QueryRowContext(
@@ -874,14 +1023,14 @@ func (w *writerHandle) QueryRowContext(
 	return db.QueryRowContext(ctx, query, args...)
 }
 
-func (w *writerHandle) Begin() (*sql.Tx, error) {
+func (w *writerHandle) Begin(ctx context.Context) (*sql.Tx, error) {
 	w.owner.connMu.RLock()
 	defer w.owner.connMu.RUnlock()
 	db, err := w.current()
 	if err != nil {
 		return nil, err
 	}
-	return db.Begin()
+	return db.BeginTx(ctx, nil)
 }
 
 func (w *writerHandle) BeginTx(
@@ -1028,20 +1177,53 @@ func configureReaderPool(reader *sql.DB) {
 // re-sync so the new fields are populated without losing archived data.
 // If the schema is current but the data version is stale, the database
 // is also preserved and marked for a re-sync on the next cycle.
-func Open(path string) (*DB, error) {
-	return open(context.Background(), path, true)
+func Open(ctx context.Context, path string) (*DB, error) {
+	return open(ctx, path, true, config.ArchiveContentFull, nil)
+}
+
+// OpenWithArchiveContent opens an archive under a storage policy. The policy
+// is active before startup migrations run so they cannot reinterpret
+// classifications whose source text was discarded.
+func OpenWithArchiveContent(
+	ctx context.Context, path string, policy config.ArchiveContent,
+) (*DB, error) {
+	return OpenWithProgress(ctx, path, policy, nil)
+}
+
+// OpenProgress describes database startup work or a required archive rebuild.
+type OpenProgress struct {
+	Detail         string
+	ResyncRequired bool
+}
+
+// OpenProgressFunc reports a database startup stage before its work begins.
+// Callbacks run synchronously and must not write to the archive.
+type OpenProgressFunc func(OpenProgress)
+
+func (progress OpenProgressFunc) report(detail string) {
+	if progress != nil {
+		progress(OpenProgress{Detail: detail})
+	}
+}
+
+// OpenWithProgress opens an archive under a storage policy and reports schema,
+// index, and migration work. A nil callback disables progress reporting.
+func OpenWithProgress(
+	ctx context.Context, path string, policy config.ArchiveContent, progress OpenProgressFunc,
+) (*DB, error) {
+	return open(ctx, path, true, policy, progress)
 }
 
 // OpenIsolated opens an archive without starting long-running database
 // maintenance. Short-lived, isolated workflows must close the returned DB.
-func OpenIsolated(path string) (*DB, error) {
-	return open(context.Background(), path, false)
+func OpenIsolated(ctx context.Context, path string) (*DB, error) {
+	return open(ctx, path, false, config.ArchiveContentFull, nil)
 }
 
 // OpenIsolatedContext is OpenIsolated with cooperative cancellation between
 // database initialization phases. The returned database must be closed.
 func OpenIsolatedContext(ctx context.Context, path string) (*DB, error) {
-	return open(ctx, path, false)
+	return open(ctx, path, false, config.ArchiveContentFull, nil)
 }
 
 // OpenFreshIsolatedContext initializes a current-schema archive in an empty,
@@ -1059,12 +1241,18 @@ func OpenFreshIsolatedContext(ctx context.Context, path string) (*DB, error) {
 	if !info.Mode().IsRegular() || info.Size() != 0 {
 		return nil, errors.New("fresh database file must be an empty regular file")
 	}
-	d, err := openAndInit(ctx, path, false, false)
+	d, err := openAndInit(ctx, path, false, false, nil)
 	if err != nil {
 		return nil, err
 	}
 	closeOnError := func(err error) (*DB, error) {
 		return nil, errors.Join(err, d.CloseContext(ctx))
+	}
+	d.mu.Lock()
+	err = ensureConversationSchemaLocked(ctx, d.getWriter())
+	d.mu.Unlock()
+	if err != nil {
+		return closeOnError(fmt.Errorf("initializing conversation export state: %w", err))
 	}
 	if _, err := d.GetOrCreateDatabaseID(ctx); err != nil {
 		return closeOnError(fmt.Errorf("initializing database id: %w", err))
@@ -1084,8 +1272,15 @@ func OpenFreshIsolatedContext(ctx context.Context, path string) (*DB, error) {
 	return d, nil
 }
 
-func open(ctx context.Context, path string, backgroundMaintenance bool) (*DB, error) {
+func open(
+	ctx context.Context, path string,
+	backgroundMaintenance bool, policy config.ArchiveContent,
+	progress OpenProgressFunc,
+) (*DB, error) {
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := checkSimpleFTSRuntimeConfig(); err != nil {
 		return nil, err
 	}
 	dir := filepath.Dir(path)
@@ -1096,18 +1291,25 @@ func open(ctx context.Context, path string, backgroundMaintenance bool) (*DB, er
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	schemaRepairNeeded, dataStale, err := probeDatabase(path)
+	progress.report("Opening database")
+	schemaRepairNeeded, dataStale, err := probeDatabase(ctx, path)
 	if err != nil {
 		return nil, fmt.Errorf("checking database: %w", err)
+	}
+	if (dataStale || schemaRepairNeeded) && progress != nil {
+		progress(OpenProgress{
+			Detail: "Database upgrade requires full resync", ResyncRequired: true,
+		})
 	}
 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	d, err := openAndInit(ctx, path, schemaRepairNeeded, backgroundMaintenance)
+	d, err := openAndInit(ctx, path, schemaRepairNeeded, backgroundMaintenance, progress)
 	if err != nil {
 		return nil, err
 	}
+	d.SetArchiveContent(policy)
 	closeOnError := func(err error) (*DB, error) {
 		if _, bounded := ctx.Deadline(); bounded {
 			return nil, errors.Join(err, d.CloseContext(ctx))
@@ -1118,9 +1320,10 @@ func open(ctx context.Context, path string, backgroundMaintenance bool) (*DB, er
 	if err := ctx.Err(); err != nil {
 		return closeOnError(err)
 	}
-	if err := d.migrateColumns(ctx); err != nil {
+	if err := d.migrateColumns(ctx, progress); err != nil {
 		return closeOnError(fmt.Errorf("migrating columns: %w", err))
 	}
+	progress.report("Finalizing database setup")
 	if err := ctx.Err(); err != nil {
 		return closeOnError(err)
 	}
@@ -1177,7 +1380,7 @@ CREATE TABLE IF NOT EXISTS project_identity_observation_changes (
     root_path   TEXT NOT NULL DEFAULT '',
     git_remote  TEXT NOT NULL DEFAULT '',
     revision    INTEGER NOT NULL,
-    deleted     INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1)),
+    deleted     INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (project, machine, root_path, git_remote)
 );
 CREATE INDEX IF NOT EXISTS idx_project_identity_observation_changes_revision
@@ -1186,7 +1389,7 @@ CREATE TABLE IF NOT EXISTS session_project_identity_snapshot_changes (
     session_id  TEXT NOT NULL,
     project     TEXT NOT NULL,
     revision    INTEGER NOT NULL,
-    deleted     INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1)),
+    deleted     INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (session_id, project)
 );
 CREATE INDEX IF NOT EXISTS idx_session_project_identity_snapshot_changes_revision
@@ -1406,8 +1609,8 @@ var exportIdentityUpgradeTables = map[string]struct{}{
 }
 
 func exportSchemaUpgradeTarget(err error) (*SchemaUpgradeRequiredError, bool) {
-	var target *SchemaUpgradeRequiredError
-	if !errors.As(err, &target) {
+	target, hasTarget := errors.AsType[*SchemaUpgradeRequiredError](err)
+	if !hasTarget {
 		return nil, false
 	}
 	_, ok := exportIdentityUpgradeTables[target.Table]
@@ -1438,7 +1641,7 @@ func exportSchemaUpgradeEligible(
 // UpgradeExportSchemaInPlace applies only the additive identity schema needed
 // by daemonless exports. Other schema gaps still require the normal writable
 // daemon migration or rebuild path.
-func UpgradeExportSchemaInPlace(path string, cause error) (retErr error) {
+func UpgradeExportSchemaInPlace(ctx context.Context, path string, cause error) (retErr error) {
 	target, ok := exportSchemaUpgradeTarget(cause)
 	if !ok {
 		return fmt.Errorf("schema gap is not eligible for export upgrade: %w", cause)
@@ -1451,7 +1654,7 @@ func UpgradeExportSchemaInPlace(path string, cause error) (retErr error) {
 		return fmt.Errorf("upgrading database schema: %s is empty", path)
 	}
 
-	writer, err := sql.Open("sqlite3", makeDSN(path, false))
+	writer, err := sql.Open(sqliteArchiveDriverName, makeDSN(path, false))
 	if err != nil {
 		return fmt.Errorf("opening schema upgrade writer: %w", err)
 	}
@@ -1462,41 +1665,42 @@ func UpgradeExportSchemaInPlace(path string, cause error) (retErr error) {
 		}
 	}()
 	writer.SetMaxOpenConns(1)
-	if err := writer.Ping(); err != nil {
+	if err := writer.PingContext(ctx); err != nil {
 		return fmt.Errorf("opening schema upgrade writer: %w", err)
 	}
 
-	tx, err := writer.BeginTx(context.Background(), nil)
+	tx, err := writer.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("starting schema upgrade transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	eligible, err := exportSchemaUpgradeEligible(context.Background(), tx, target)
+	eligible, err := exportSchemaUpgradeEligible(ctx, tx, target)
 	if err != nil {
 		return err
 	}
 	if !eligible {
 		return fmt.Errorf("schema gap is not eligible for export upgrade: %w", cause)
 	}
-	if _, err := tx.Exec(exportIdentitySchemaSQL); err != nil {
+	if _, err := tx.ExecContext(ctx, exportIdentitySchemaSQL); err != nil {
 		return fmt.Errorf("initializing export identity schema: %w", err)
 	}
 	if err := applyColumnMigrations(
 		exportIdentityColumnMigrations,
 		func(query string, args ...any) rowScanner {
-			return tx.QueryRow(query, args...)
+			return tx.QueryRowContext(ctx, query, args...)
 		},
 		func(query string, args ...any) (sql.Result, error) {
-			return tx.Exec(query, args...)
+			return tx.ExecContext(ctx, query, args...)
 		},
+		nil,
 	); err != nil {
 		return err
 	}
-	if err := initializeSchemaUpgradeMetadata(tx); err != nil {
+	if err := initializeSchemaUpgradeMetadata(ctx, tx); err != nil {
 		return err
 	}
 	if err := ensureProjectIdentityBackfillQueuedTx(
-		context.Background(), tx,
+		ctx, tx,
 	); err != nil {
 		return err
 	}
@@ -1506,7 +1710,7 @@ func UpgradeExportSchemaInPlace(path string, cause error) (retErr error) {
 	return nil
 }
 
-func initializeSchemaUpgradeMetadata(tx *sql.Tx) error {
+func initializeSchemaUpgradeMetadata(ctx context.Context, tx *sql.Tx) error {
 	databaseID, err := newUUIDv4()
 	if err != nil {
 		return fmt.Errorf("generating database id: %w", err)
@@ -1525,9 +1729,9 @@ func initializeSchemaUpgradeMetadata(tx *sql.Tx) error {
 	}{
 		{archiveMetadataDatabaseIDKey, databaseID},
 		{archiveMetadataArchiveIDKey, archiveID},
-		{archiveMetadataArchiveSaltKey, fmt.Sprintf("%x", random)},
+		{archiveMetadataArchiveSaltKey, hex.EncodeToString(random)},
 	} {
-		if _, err := tx.Exec(`
+		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO archive_metadata (key, value)
 			VALUES (?, ?)
 			ON CONFLICT(key) DO UPDATE SET
@@ -1546,7 +1750,10 @@ func initializeSchemaUpgradeMetadata(tx *sql.Tx) error {
 // OpenReadOnly opens an existing SQLite database without running migrations or
 // any writable initialization. It is intended for cold CLI reads and recovery
 // cases where another process may own writable access to the archive.
-func OpenReadOnly(path string) (*DB, error) {
+func OpenReadOnly(ctx context.Context, path string) (*DB, error) {
+	if err := checkSimpleFTSRuntimeConfig(); err != nil {
+		return nil, err
+	}
 	info, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -1564,17 +1771,17 @@ func OpenReadOnly(path string) (*DB, error) {
 		)
 	}
 
-	reader, err := sql.Open(sqliteUsageDriverName, makeDSN(path, true))
+	reader, err := sql.Open(sqliteArchiveDriverName, makeDSN(path, true))
 	if err != nil {
 		return nil, fmt.Errorf("opening read-only reader: %w", err)
 	}
 	configureReaderPool(reader)
-	if err := reader.Ping(); err != nil {
+	if err := reader.PingContext(ctx); err != nil {
 		reader.Close()
 		return nil, fmt.Errorf("opening read-only reader: %w", err)
 	}
 
-	schemaStale, _, err := probeDatabaseConn(reader)
+	schemaStale, dataStale, err := probeDatabaseConn(ctx, reader)
 	if err != nil {
 		reader.Close()
 		return nil, fmt.Errorf(
@@ -1583,11 +1790,9 @@ func OpenReadOnly(path string) (*DB, error) {
 	}
 	if schemaStale {
 		reader.Close()
-		return nil, fmt.Errorf(
-			"opening read-only database: schema is stale or incomplete",
-		)
+		return nil, errors.New("opening read-only database: schema is stale or incomplete")
 	}
-	if err := checkReadOnlySchemaCompatibility(reader); err != nil {
+	if err := checkReadOnlySchemaCompatibility(ctx, reader); err != nil {
 		reader.Close()
 		return nil, err
 	}
@@ -1596,6 +1801,7 @@ func OpenReadOnly(path string) (*DB, error) {
 		path: path, readOnly: true,
 		usageCache: newUsageCacheManager(path),
 	}
+	db.dataStale.Store(dataStale)
 	db.usageCache.attachArchive(db)
 	db.reader.Store(reader)
 	db.cursorSecret = make([]byte, 32)
@@ -1620,6 +1826,7 @@ var readOnlyRequiredTables = []string{
 	"starred_sessions",
 	"excluded_sessions",
 	"worktree_project_mappings",
+	"session_project_assignments",
 	"archive_metadata",
 	"background_migrations",
 	"project_identity_observations",
@@ -1653,41 +1860,46 @@ var readOnlyRequiredTables = []string{
 var (
 	readOnlyRequiredSchemaOnce sync.Once
 	readOnlyRequiredSchemaMap  map[string][]string
-	readOnlyRequiredSchemaErr  error
+	errReadOnlyRequiredSchema  error
 )
 
-func readOnlyRequiredSchema() (map[string][]string, error) {
+func readOnlyRequiredSchema(ctx context.Context) (map[string][]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// This immutable process-wide probe must not cache a caller cancellation.
+	// Checks against each archive still use its open operation context.
+	ctx = context.WithoutCancel(ctx)
 	readOnlyRequiredSchemaOnce.Do(func() {
-		conn, err := sql.Open("sqlite3", ":memory:")
+		conn, err := sql.Open(sqliteArchiveDriverName, ":memory:")
 		if err != nil {
-			readOnlyRequiredSchemaErr = fmt.Errorf(
+			errReadOnlyRequiredSchema = fmt.Errorf(
 				"opening schema probe: %w", err,
 			)
 			return
 		}
 		defer conn.Close()
-		if _, err := conn.Exec(schemaSQL); err != nil {
-			readOnlyRequiredSchemaErr = fmt.Errorf(
+		if _, err := conn.ExecContext(ctx, schemaSQL); err != nil {
+			errReadOnlyRequiredSchema = fmt.Errorf(
 				"loading schema probe: %w", err,
 			)
 			return
 		}
-		schema, err := tableColumns(conn, readOnlyRequiredTables)
+		schema, err := tableColumns(ctx, conn, readOnlyRequiredTables)
 		if err != nil {
-			readOnlyRequiredSchemaErr = err
+			errReadOnlyRequiredSchema = err
 			return
 		}
 		for _, table := range readOnlyRequiredTables {
 			if len(schema[table]) == 0 {
-				readOnlyRequiredSchemaErr =
-					fmt.Errorf("schema table %s is missing", table)
+				errReadOnlyRequiredSchema = fmt.Errorf("schema table %s is missing", table)
 				return
 			}
 		}
 		readOnlyRequiredSchemaMap = schema
 	})
-	if readOnlyRequiredSchemaErr != nil {
-		return nil, readOnlyRequiredSchemaErr
+	if errReadOnlyRequiredSchema != nil {
+		return nil, errReadOnlyRequiredSchema
 	}
 	out := make(map[string][]string, len(readOnlyRequiredSchemaMap))
 	for table, columns := range readOnlyRequiredSchemaMap {
@@ -1696,36 +1908,30 @@ func readOnlyRequiredSchema() (map[string][]string, error) {
 	return out, nil
 }
 
-func tableColumns(
-	conn *sql.DB,
-	tables []string,
-) (map[string][]string, error) {
+func tableColumns(ctx context.Context, conn *sql.DB, tables []string) (map[string][]string, error) {
 	out := make(map[string][]string, len(tables))
 	for _, table := range tables {
-		rows, err := conn.Query(
-			"SELECT name FROM pragma_table_info(?) ORDER BY cid",
-			table,
-		)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"reading schema %s: %w", table, err,
-			)
-		}
-		var columns []string
-		for rows.Next() {
-			var name string
-			if err := rows.Scan(&name); err != nil {
-				rows.Close()
-				return nil, fmt.Errorf(
-					"reading schema %s: %w", table, err,
-				)
+		columns, err := func() ([]string, error) {
+			rows, err := conn.QueryContext(ctx, "SELECT name FROM pragma_table_info(?) ORDER BY cid", table)
+			if err != nil {
+				return nil, fmt.Errorf("reading schema %s: %w", table, err)
 			}
-			columns = append(columns, name)
-		}
-		if err := rows.Close(); err != nil {
-			return nil, fmt.Errorf(
-				"reading schema %s: %w", table, err,
-			)
+			defer rows.Close()
+			var columns []string
+			for rows.Next() {
+				var name string
+				if err := rows.Scan(&name); err != nil {
+					return nil, fmt.Errorf("reading schema %s: %w", table, err)
+				}
+				columns = append(columns, name)
+			}
+			if err := rows.Err(); err != nil {
+				return nil, fmt.Errorf("reading schema %s: %w", table, err)
+			}
+			return columns, nil
+		}()
+		if err != nil {
+			return nil, err
 		}
 		out[table] = columns
 	}
@@ -1760,16 +1966,16 @@ func (e *SchemaUpgradeRequiredError) Error() string {
 // because the archive predates this binary's schema and needs a writable
 // migration to run.
 func IsSchemaUpgradeRequired(err error) bool {
-	var target *SchemaUpgradeRequiredError
-	return errors.As(err, &target)
+	_, hasTarget := errors.AsType[*SchemaUpgradeRequiredError](err)
+	return hasTarget
 }
 
-func checkReadOnlySchemaCompatibility(conn *sql.DB) error {
-	required, err := readOnlyRequiredSchema()
+func checkReadOnlySchemaCompatibility(ctx context.Context, conn *sql.DB) error {
+	required, err := readOnlyRequiredSchema(ctx)
 	if err != nil {
 		return err
 	}
-	actual, err := tableColumns(conn, readOnlyRequiredTables)
+	actual, err := tableColumns(ctx, conn, readOnlyRequiredTables)
 	if err != nil {
 		return fmt.Errorf("checking read-only schema: %w", err)
 	}
@@ -1793,7 +1999,7 @@ func checkReadOnlySchemaCompatibility(conn *sql.DB) error {
 		"idx_messages_activity_timestamp",
 	} {
 		var present bool
-		if err := conn.QueryRow(`SELECT EXISTS(SELECT 1 FROM sqlite_master
+		if err := conn.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_master
 			WHERE type = 'index' AND name = ?)`, index).Scan(&present); err != nil {
 			return fmt.Errorf("checking read-only index %s: %w", index, err)
 		}
@@ -1804,9 +2010,9 @@ func checkReadOnlySchemaCompatibility(conn *sql.DB) error {
 	return nil
 }
 
-func (db *DB) hasCursorUsageTable() bool {
+func (db *DB) hasCursorUsageTable(ctx context.Context) bool {
 	var n int
-	err := db.getReader().QueryRow(
+	err := db.getReader().QueryRow(ctx,
 		"SELECT 1 FROM sqlite_master WHERE type='table' AND name='cursor_usage_events'",
 	).Scan(&n)
 	return err == nil && n == 1
@@ -1815,16 +2021,24 @@ func (db *DB) hasCursorUsageTable() bool {
 // CheckDataVersion verifies that the database file, when present, was not
 // written by a newer agentsview binary. Older data versions are compatible
 // with startup because callers can run the normal non-destructive resync path.
-func CheckDataVersion(path string) error {
-	_, _, err := probeDatabase(path)
+func CheckDataVersion(ctx context.Context, path string) error {
+	_, _, err := probeDatabase(ctx, path)
 	return err
+}
+
+// ArchiveNeedsResync probes an existing archive without modifying it. A
+// required schema repair or data reparse cannot be deferred to a live sync
+// worker, which is not allowed to replace the daemon's open archive.
+func ArchiveNeedsResync(ctx context.Context, path string) (bool, error) {
+	schemaStale, dataStale, err := probeDatabase(ctx, path)
+	return schemaStale || dataStale, err
 }
 
 // probeDatabase checks an existing database for schema and data staleness.
 // It returns (schemaRepairNeeded, dataStale, err). A writable Open repairs
 // missing legacy columns before initializing schema indexes, then requires a
 // non-destructive resync. dataStale means user_version < dataVersion.
-func probeDatabase(
+func probeDatabase(ctx context.Context,
 	path string,
 ) (schemaRepairNeeded, dataStale bool, err error) {
 	if _, err := os.Stat(path); err != nil {
@@ -1835,7 +2049,7 @@ func probeDatabase(
 			"checking database file: %w", err,
 		)
 	}
-	conn, err := sql.Open("sqlite3", makeDSN(path, true))
+	conn, err := sql.Open(sqliteArchiveDriverName, makeDSN(path, true))
 	if err != nil {
 		return false, false, fmt.Errorf(
 			"probing schema: %w", err,
@@ -1843,13 +2057,13 @@ func probeDatabase(
 	}
 	defer conn.Close()
 
-	return probeDatabaseConn(conn)
+	return probeDatabaseConn(ctx, conn)
 }
 
-func probeDatabaseConn(
+func probeDatabaseConn(ctx context.Context,
 	conn *sql.DB,
 ) (schemaRepairNeeded, dataStale bool, err error) {
-	version, err := readUserVersion(conn)
+	version, err := readUserVersion(ctx, conn)
 	if err != nil {
 		return false, false, err
 	}
@@ -1860,7 +2074,7 @@ func probeDatabaseConn(
 		}
 	}
 
-	schema, err := needsSchemaRepair(conn)
+	schema, err := needsSchemaRepair(ctx, conn)
 	if err != nil {
 		return false, false, err
 	}
@@ -1874,10 +2088,10 @@ func probeDatabaseConn(
 // needsSchemaRepair probes for required legacy columns that may be missing in
 // databases created by older releases. Open adds them before initializing
 // schema indexes, then triggers a non-destructive full resync.
-func needsSchemaRepair(conn *sql.DB) (bool, error) {
+func needsSchemaRepair(ctx context.Context, conn *sql.DB) (bool, error) {
 	for _, migration := range legacySchemaColumnMigrations() {
 		var count int
-		err := conn.QueryRow(fmt.Sprintf(
+		err := conn.QueryRowContext(ctx, fmt.Sprintf(
 			"SELECT count(*) FROM pragma_table_info('%s')"+
 				" WHERE name = '%s'",
 			migration.table, migration.column,
@@ -1895,9 +2109,9 @@ func needsSchemaRepair(conn *sql.DB) (bool, error) {
 	return false, nil
 }
 
-func readUserVersion(conn *sql.DB) (int, error) {
+func readUserVersion(ctx context.Context, conn *sql.DB) (int, error) {
 	var version int
-	err := conn.QueryRow(
+	err := conn.QueryRowContext(ctx,
 		"PRAGMA user_version",
 	).Scan(&version)
 	if err != nil {
@@ -1918,6 +2132,14 @@ type schemaColumnMigration struct {
 // that must exist before db.init executes schema.sql.
 func legacySchemaColumnMigrations() []schemaColumnMigration {
 	return []schemaColumnMigration{
+		{
+			"tool_result_events", "raw_content_digest",
+			"ALTER TABLE tool_result_events ADD COLUMN raw_content_digest BLOB",
+		},
+		{
+			"tool_result_events", "summary_participates",
+			"ALTER TABLE tool_result_events ADD COLUMN summary_participates INTEGER",
+		},
 		{
 			"sessions", "parent_session_id",
 			"ALTER TABLE sessions ADD COLUMN parent_session_id TEXT",
@@ -1955,6 +2177,15 @@ func legacySchemaColumnMigrations() []schemaColumnMigration {
 
 func schemaColumnMigrations() []schemaColumnMigration {
 	return []schemaColumnMigration{
+		{"excluded_sessions", "file_path", "ALTER TABLE excluded_sessions ADD COLUMN file_path TEXT"},
+		{
+			"session_project_assignments", "original_project",
+			"ALTER TABLE session_project_assignments ADD COLUMN original_project TEXT NOT NULL DEFAULT '';" +
+				" UPDATE session_project_assignments SET original_project = COALESCE(" +
+				"NULLIF((SELECT project FROM session_project_identity_snapshots " +
+				"WHERE session_id = session_project_assignments.session_id), ''), project) " +
+				"WHERE original_project = ''",
+		},
 		{
 			"model_pricing", "cache_creation_1h_microdollars_per_mtok",
 			"ALTER TABLE model_pricing ADD COLUMN cache_creation_1h_microdollars_per_mtok INTEGER NOT NULL DEFAULT 0",
@@ -2030,6 +2261,10 @@ func schemaColumnMigrations() []schemaColumnMigration {
 		{
 			"messages", "model",
 			"ALTER TABLE messages ADD COLUMN model TEXT NOT NULL DEFAULT ''",
+		},
+		{
+			"messages", "reasoning_effort",
+			"ALTER TABLE messages ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT ''",
 		},
 		{
 			"messages", "token_usage",
@@ -2421,14 +2656,14 @@ func schemaColumnMigrations() []schemaColumnMigration {
 	}
 }
 
-func applySchemaColumnMigrations(w *writerHandle) error {
-	tx, err := w.BeginTx(context.Background(), nil)
+func applySchemaColumnMigrations(ctx context.Context, w *writerHandle, progress OpenProgressFunc) error {
+	tx, err := w.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("starting column migration transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if _, err := tx.Exec(provider_freshnessDDL); err != nil {
+	if _, err := tx.ExecContext(ctx, provider_freshnessDDL); err != nil {
 		return fmt.Errorf(
 			"creating provider_freshness side-table: %w", err)
 	}
@@ -2436,9 +2671,10 @@ func applySchemaColumnMigrations(w *writerHandle) error {
 	if err := applyColumnMigrations(
 		schemaColumnMigrations(),
 		func(query string, args ...any) rowScanner {
-			return tx.QueryRow(query, args...)
+			return tx.QueryRowContext(ctx, query, args...)
 		},
 		tx.Exec,
+		progress,
 	); err != nil {
 		return err
 	}
@@ -2452,6 +2688,7 @@ func applyColumnMigrations(
 	migrations []schemaColumnMigration,
 	queryRow func(string, ...any) rowScanner,
 	exec func(string, ...any) (sql.Result, error),
+	progress OpenProgressFunc,
 ) error {
 	for _, m := range migrations {
 		var tableCount int
@@ -2479,6 +2716,7 @@ func applyColumnMigrations(
 			)
 		}
 		if count == 0 {
+			progress.report(fmt.Sprintf("Adding column %s.%s", m.table, m.column))
 			if _, err := exec(m.ddl); err != nil {
 				return fmt.Errorf(
 					"adding %s.%s: %w",
@@ -2497,7 +2735,7 @@ func applyColumnMigrations(
 // repairLegacySchemaBeforeInit adds legacy columns before schema initialization.
 // The stale data marker is committed in the same transaction so a restart
 // cannot skip the required full resync.
-func repairLegacySchemaBeforeInit(ctx context.Context, w *writerHandle) error {
+func repairLegacySchemaBeforeInit(ctx context.Context, w *writerHandle, progress OpenProgressFunc) error {
 	tx, err := w.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("starting schema repair transaction: %w", err)
@@ -2512,6 +2750,7 @@ func repairLegacySchemaBeforeInit(ctx context.Context, w *writerHandle) error {
 		func(query string, args ...any) (sql.Result, error) {
 			return tx.ExecContext(ctx, query, args...)
 		},
+		progress,
 	); err != nil {
 		return err
 	}
@@ -2562,7 +2801,8 @@ CREATE TRIGGER IF NOT EXISTS artifact_sessions_insert_queue
 AFTER INSERT ON sessions WHEN (
     NEW.machine = 'local' OR EXISTS (
         SELECT 1 FROM pg_sync_state
-        WHERE key = 'artifact_local_machine_name' AND value = NEW.machine
+        WHERE key IN ('artifact_local_machine_name', 'artifact_local_installation_id')
+          AND value = NEW.machine
     )
 ) AND EXISTS (
     SELECT 1 FROM pg_sync_state WHERE key = 'artifact_origin_id'
@@ -2583,7 +2823,7 @@ AFTER UPDATE ON sessions
 WHEN (
     OLD.machine = 'local' OR NEW.machine = 'local' OR EXISTS (
         SELECT 1 FROM pg_sync_state
-        WHERE key = 'artifact_local_machine_name'
+        WHERE key IN ('artifact_local_machine_name', 'artifact_local_installation_id')
           AND (value = OLD.machine OR value = NEW.machine)
     )
 ) AND EXISTS (
@@ -2661,7 +2901,8 @@ CREATE TRIGGER IF NOT EXISTS artifact_sessions_delete_queue
 BEFORE DELETE ON sessions WHEN (
     OLD.machine = 'local' OR EXISTS (
         SELECT 1 FROM pg_sync_state
-        WHERE key = 'artifact_local_machine_name' AND value = OLD.machine
+        WHERE key IN ('artifact_local_machine_name', 'artifact_local_installation_id')
+          AND value = OLD.machine
     )
 ) AND EXISTS (
     SELECT 1 FROM pg_sync_state WHERE key = 'artifact_origin_id'
@@ -2681,14 +2922,15 @@ END;
 // migrateColumns adds columns introduced by this branch to databases created
 // by older releases, then runs the data repairs required by a normal writable
 // startup. Schema-only callers use applySchemaColumnMigrations directly.
-func (db *DB) migrateColumns(ctx context.Context) error {
+func (db *DB) migrateColumns(ctx context.Context, progress OpenProgressFunc) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	w := db.getWriter()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := migrateMoneyColumnsLocked(w); err != nil {
+	progress.report("Migrating database columns")
+	if err := migrateMoneyColumnsLocked(ctx, w); err != nil {
 		return err
 	}
 	if _, err := w.ExecContext(ctx, modelPricingBandsSchemaSQL); err != nil {
@@ -2703,7 +2945,7 @@ func (db *DB) migrateColumns(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := applySchemaColumnMigrations(w); err != nil {
+	if err := applySchemaColumnMigrations(ctx, w, progress); err != nil {
 		return err
 	}
 	if _, err := w.ExecContext(ctx, artifactSessionQueueTriggerCreatesSQL); err != nil {
@@ -2712,25 +2954,36 @@ func (db *DB) migrateColumns(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	progress.report("Updating database indexes and triggers")
 	if err := installSyncMarkerSchemaLocked(ctx, w); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := db.createPartialIndexesLocked(w); err != nil {
+	if err := db.createPartialIndexesLocked(ctx, w); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := db.backfillIsAutomatedLocked(w); err != nil {
+	progress.report("Backfilling database metadata")
+	if err := db.backfillIsAutomatedLocked(ctx, w); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := db.backfillToolCallFieldsLocked(w); err != nil {
+	if err := db.backfillToolCallFieldsLocked(ctx, w); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := scopeLegacyDevinSourceUUIDsLocked(ctx, w); err != nil {
+		return err
+	}
+	if err := ensureConversationSchemaLocked(ctx, w); err != nil {
 		return err
 	}
 
@@ -2741,6 +2994,15 @@ func (db *DB) migrateColumns(ctx context.Context) error {
 	); err != nil {
 		return fmt.Errorf(
 			"creating idx_tool_calls_file_path: %w", err,
+		)
+	}
+	if _, err := w.Exec(ctx,
+		`CREATE INDEX IF NOT EXISTS idx_tool_calls_session_tool_use
+		 ON tool_calls(session_id, tool_use_id)
+		 WHERE tool_use_id IS NOT NULL`,
+	); err != nil {
+		return fmt.Errorf(
+			"creating idx_tool_calls_session_tool_use: %w", err,
 		)
 	}
 
@@ -2804,9 +3066,41 @@ func (db *DB) migrateColumns(ctx context.Context) error {
 			ON worktree_project_mappings(machine, enabled, path_prefix);
 		CREATE INDEX IF NOT EXISTS idx_worktree_project_mappings_project
 			ON worktree_project_mappings(machine, project);
+		CREATE TABLE IF NOT EXISTS session_project_assignments (
+			session_id       TEXT PRIMARY KEY,
+			project          TEXT NOT NULL,
+			original_project TEXT NOT NULL,
+			created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+			updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+		);
+		CREATE TRIGGER IF NOT EXISTS trg_sessions_apply_project_assignment_insert
+		AFTER INSERT ON sessions
+		WHEN EXISTS (
+			SELECT 1 FROM session_project_assignments WHERE session_id = NEW.id
+		)
+		BEGIN
+			UPDATE sessions
+			SET project = (
+				SELECT project FROM session_project_assignments WHERE session_id = NEW.id
+			)
+			WHERE id = NEW.id;
+		END;
+		CREATE TRIGGER IF NOT EXISTS trg_sessions_apply_project_assignment_update
+		AFTER UPDATE OF project ON sessions
+		WHEN EXISTS (
+			SELECT 1 FROM session_project_assignments
+			WHERE session_id = NEW.id AND project != NEW.project
+		)
+		BEGIN
+			UPDATE sessions
+			SET project = (
+				SELECT project FROM session_project_assignments WHERE session_id = NEW.id
+			)
+			WHERE id = NEW.id;
+		END;
 	`); err != nil {
 		return fmt.Errorf(
-			"creating worktree_project_mappings: %w", err,
+			"creating project mapping tables: %w", err,
 		)
 	}
 	if _, err := w.ExecContext(ctx, `
@@ -2880,40 +3174,40 @@ func (db *DB) migrateColumns(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := db.scrubProjectIdentityGitRemoteCredentialsLocked(w); err != nil {
+	if err := db.scrubProjectIdentityGitRemoteCredentialsLocked(ctx, w); err != nil {
 		return err
 	}
 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := db.ensureUsageEventsSchemaLocked(w); err != nil {
+	if err := db.ensureUsageEventsSchemaLocked(ctx, w); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := db.ensureCursorUsageEventsSchemaLocked(w); err != nil {
+	if err := db.ensureCursorUsageEventsSchemaLocked(ctx, w); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := requeueInvalidArtifactPublicationsLocked(w); err != nil {
+	if err := requeueInvalidArtifactPublicationsLocked(ctx, w); err != nil {
 		return err
 	}
 
-	runRepair, err := db.shouldRunTokenCoverageRepairLocked(w)
+	runRepair, err := db.shouldRunTokenCoverageRepairLocked(ctx, w)
 	if err != nil {
 		return err
 	}
 	if !runRepair {
 		return nil
 	}
-	if err := db.backfillTokenCoverageFlagsLocked(w); err != nil {
+	if err := db.backfillTokenCoverageFlagsLocked(ctx, w); err != nil {
 		return err
 	}
-	if err := db.markTokenCoverageRepairDoneLocked(w); err != nil {
+	if err := db.markTokenCoverageRepairDoneLocked(ctx, w); err != nil {
 		return err
 	}
 	return nil
@@ -2923,7 +3217,7 @@ const modelPricingBandsSchemaSQL = `
 CREATE TABLE IF NOT EXISTS model_pricing_bands (
     model_pattern TEXT NOT NULL
         REFERENCES model_pricing(model_pattern) ON DELETE CASCADE,
-    above_input_tokens INTEGER NOT NULL CHECK (above_input_tokens > 0),
+    above_input_tokens INTEGER NOT NULL,
     input_microdollars_per_mtok INTEGER NOT NULL,
     output_microdollars_per_mtok INTEGER NOT NULL,
     cache_creation_microdollars_per_mtok INTEGER NOT NULL,
@@ -2936,10 +3230,10 @@ CREATE TABLE IF NOT EXISTS model_pricing_bands (
 
 const genAIPricingSchemaSQL = `
 CREATE TABLE IF NOT EXISTS genai_pricing (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    singleton INTEGER PRIMARY KEY,
     version TEXT NOT NULL,
     source_ref TEXT NOT NULL DEFAULT '',
-    source TEXT NOT NULL CHECK (source IN ('embedded', 'fetched')),
+    source TEXT NOT NULL,
     data_json BLOB NOT NULL,
     updated_at TEXT NOT NULL
         DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
@@ -2950,18 +3244,18 @@ const (
 		INSERT OR IGNORE INTO artifact_export_queue(session_id)
 		SELECT id FROM sessions
 		WHERE (
-			machine = 'local' OR machine = (
+			machine = 'local' OR machine IN (
 				SELECT value FROM pg_sync_state
-				WHERE key = 'artifact_local_machine_name'
+				WHERE key IN ('artifact_local_machine_name', 'artifact_local_installation_id')
 			)
 		) AND deleted_at IS NULL`
 	requeueArtifactExportsSQL = `
 		INSERT INTO artifact_export_queue(session_id)
 		SELECT id FROM sessions
 		WHERE (
-			machine = 'local' OR machine = (
+			machine = 'local' OR machine IN (
 				SELECT value FROM pg_sync_state
-				WHERE key = 'artifact_local_machine_name'
+				WHERE key IN ('artifact_local_machine_name', 'artifact_local_installation_id')
 			)
 		) AND deleted_at IS NULL
 		ON CONFLICT(session_id) DO UPDATE SET
@@ -2976,9 +3270,9 @@ const (
 		INSERT INTO artifact_export_queue(session_id)
 		SELECT id FROM sessions
 		WHERE (
-			machine = 'local' OR machine = (
+			machine = 'local' OR machine IN (
 				SELECT value FROM pg_sync_state
-				WHERE key = 'artifact_local_machine_name'
+				WHERE key IN ('artifact_local_machine_name', 'artifact_local_installation_id')
 			)
 		) AND deleted_at IS NULL
 		UNION
@@ -2994,8 +3288,8 @@ const (
 			rejected_at = NULL`
 )
 
-func requeueInvalidArtifactPublicationsLocked(w *writerHandle) error {
-	_, err := w.Exec(`
+func requeueInvalidArtifactPublicationsLocked(ctx context.Context, w *writerHandle) error {
+	_, err := w.Exec(ctx, `
 		INSERT INTO artifact_export_queue(session_id)
 		SELECT session_id
 		FROM artifact_publications
@@ -3016,7 +3310,7 @@ func requeueInvalidArtifactPublicationsLocked(w *writerHandle) error {
 	return nil
 }
 
-var populateArtifactOriginQueueTx = func(tx *sql.Tx, origin string, requeue bool) error {
+var populateArtifactOriginQueueTx = func(ctx context.Context, tx *sql.Tx, origin string, requeue bool) error {
 	statement := bootstrapArtifactExportQueueSQL
 	action := "bootstrapping"
 	args := []any(nil)
@@ -3025,7 +3319,7 @@ var populateArtifactOriginQueueTx = func(tx *sql.Tx, origin string, requeue bool
 		action = "requeueing"
 		args = append(args, origin)
 	}
-	if _, err := tx.Exec(statement, args...); err != nil {
+	if _, err := tx.ExecContext(ctx, statement, args...); err != nil {
 		return fmt.Errorf("%s artifact export queue: %w", action, err)
 	}
 	return nil
@@ -3034,27 +3328,27 @@ var populateArtifactOriginQueueTx = func(tx *sql.Tx, origin string, requeue bool
 // EnsureArtifactOrigin atomically persists candidate when no origin exists and
 // bootstraps every pre-existing local session into the export queue. A
 // concurrent initializer's committed origin wins and is returned unchanged.
-func (db *DB) EnsureArtifactOrigin(candidate string) (string, error) {
-	return db.setArtifactOrigin(candidate, false)
+func (db *DB) EnsureArtifactOrigin(ctx context.Context, candidate string) (string, error) {
+	return db.setArtifactOrigin(ctx, candidate, false)
 }
 
 // AdoptArtifactOrigin atomically persists an authoritative configured origin
 // and populates its export queue. Replacing an established origin re-dirties
 // every live local session so clean rows from the previous origin are
 // published again.
-func (db *DB) AdoptArtifactOrigin(origin string) error {
-	_, err := db.setArtifactOrigin(origin, true)
+func (db *DB) AdoptArtifactOrigin(ctx context.Context, origin string) error {
+	_, err := db.setArtifactOrigin(ctx, origin, true)
 	return err
 }
 
-func (db *DB) setArtifactOrigin(origin string, adopt bool) (string, error) {
+func (db *DB) setArtifactOrigin(ctx context.Context, origin string, adopt bool) (string, error) {
 	resolved := origin
-	err := db.Update(func(tx *sql.Tx) error {
-		if err := lockArtifactPublicationTx(context.Background(), tx); err != nil {
+	err := db.Update(ctx, func(tx *sql.Tx) error {
+		if err := lockArtifactPublicationTx(ctx, tx); err != nil {
 			return err
 		}
 		var existing string
-		err := tx.QueryRow(
+		err := tx.QueryRowContext(ctx,
 			`SELECT value FROM pg_sync_state WHERE key = 'artifact_origin_id'`,
 		).Scan(&existing)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -3066,7 +3360,7 @@ func (db *DB) setArtifactOrigin(origin string, adopt bool) (string, error) {
 				return nil
 			}
 		}
-		if _, err := tx.Exec(
+		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO pg_sync_state (key, value)
 			 VALUES ('artifact_origin_id', ?)
 			 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
@@ -3074,7 +3368,7 @@ func (db *DB) setArtifactOrigin(origin string, adopt bool) (string, error) {
 		); err != nil {
 			return fmt.Errorf("persisting artifact origin: %w", err)
 		}
-		if err := populateArtifactOriginQueueTx(tx, origin, true); err != nil {
+		if err := populateArtifactOriginQueueTx(ctx, tx, origin, true); err != nil {
 			return err
 		}
 		resolved = origin
@@ -3090,10 +3384,10 @@ func (db *DB) setArtifactOrigin(origin string, adopt bool) (string, error) {
 // once. Called by maintenance and tests that already own origin lifecycle;
 // normal origin initialization uses EnsureArtifactOrigin so the origin and
 // queue commit atomically.
-func (db *DB) BootstrapArtifactExportQueue() error {
+func (db *DB) BootstrapArtifactExportQueue(ctx context.Context) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	_, err := db.getWriter().Exec(bootstrapArtifactExportQueueSQL)
+	_, err := db.getWriter().Exec(ctx, bootstrapArtifactExportQueueSQL)
 	if err != nil {
 		return fmt.Errorf("bootstrapping artifact export queue: %w", err)
 	}
@@ -3107,10 +3401,10 @@ func (db *DB) BootstrapArtifactExportQueue() error {
 // and never re-verified under the new origin. This re-dirties the ledger so
 // the new origin publishes every owned session. The ON CONFLICT clause matches
 // the session queue triggers' generation semantics.
-func (db *DB) RequeueAllArtifactExports() error {
+func (db *DB) RequeueAllArtifactExports(ctx context.Context) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	_, err := db.getWriter().Exec(requeueArtifactExportsSQL)
+	_, err := db.getWriter().Exec(ctx, requeueArtifactExportsSQL)
 	if err != nil {
 		return fmt.Errorf("requeueing artifact export queue: %w", err)
 	}
@@ -3249,11 +3543,11 @@ func execSchemaScriptLocked(ctx context.Context, w *writerHandle) error {
 	return nil
 }
 
-func (db *DB) scrubProjectIdentityGitRemoteCredentialsLocked(
+func (db *DB) scrubProjectIdentityGitRemoteCredentialsLocked(ctx context.Context,
 	w *writerHandle,
 ) error {
 	var completed string
-	err := w.QueryRow(`SELECT value FROM stats WHERE key = ?`,
+	err := w.QueryRow(ctx, `SELECT value FROM stats WHERE key = ?`,
 		projectIdentityRemoteScrubCompletedKey).Scan(&completed)
 	if err == nil && completed == "1" {
 		return nil
@@ -3261,12 +3555,12 @@ func (db *DB) scrubProjectIdentityGitRemoteCredentialsLocked(
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("checking project identity remote scrub marker: %w", err)
 	}
-	tx, err := w.BeginTx(context.Background(), nil)
+	tx, err := w.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("starting project identity remote scrub: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.Exec(`
+	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM project_identity_observations
 		WHERE git_remote = ''
 		  AND EXISTS (
@@ -3279,11 +3573,11 @@ func (db *DB) scrubProjectIdentityGitRemoteCredentialsLocked(
 		return fmt.Errorf("removing stale project identity root fallbacks: %w", err)
 	}
 	if err := scrubProjectIdentityGitRemoteCredentialsTx(
-		context.Background(), tx,
+		ctx, tx,
 	); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`
+	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO stats (key, value) VALUES (?, '1')
 		ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
 		projectIdentityRemoteScrubCompletedKey,
@@ -3298,10 +3592,33 @@ func (db *DB) scrubProjectIdentityGitRemoteCredentialsLocked(
 
 // createPartialIndexesLocked creates partial indexes that are not
 // covered by the initial schema DDL. Idempotent via IF NOT EXISTS.
-func (db *DB) createPartialIndexesLocked(w *writerHandle) error {
+func (db *DB) createPartialIndexesLocked(ctx context.Context, w *writerHandle) error {
+	var terminalIndexExists bool
+	if err := w.QueryRow(ctx, `SELECT EXISTS (
+		SELECT 1 FROM sqlite_master WHERE type = 'index'
+		AND name = 'idx_tool_result_events_terminal'
+	)`).Scan(&terminalIndexExists); err != nil {
+		return fmt.Errorf("checking activity terminal index: %w", err)
+	}
+	if !terminalIndexExists {
+		log.Print("building SQLite activity index; startup waits for the tool-result scan to finish")
+	}
 	indexes := []string{
+		// Activity checks terminal events even for sessions whose ended_at
+		// predates the report. Avoid reading historical result payloads for
+		// every session just to find a recent tool completion.
+		`CREATE INDEX IF NOT EXISTS idx_tool_result_events_terminal
+		 ON tool_result_events(session_id, timestamp)
+		 WHERE source = 'tool_execution'
+		   AND status IN ('completed', 'errored')
+		   AND timestamp IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_cwd
 		 ON sessions(cwd) WHERE cwd != ''`,
+		`CREATE INDEX IF NOT EXISTS idx_sessions_recent_source_activity
+		 ON sessions(agent, machine, julianday(ended_at) DESC, id)
+		 WHERE file_path IS NOT NULL AND file_path != ''
+		   AND file_path NOT LIKE 's3://%'
+		   AND deleted_at IS NULL AND source_missing_at IS NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_project_git_branch
 		 ON sessions(project, git_branch) WHERE git_branch != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_messages_compact_boundary
@@ -3322,15 +3639,15 @@ func (db *DB) createPartialIndexesLocked(w *writerHandle) error {
 		 ON sessions(secret_leak_count) WHERE secret_leak_count > 0`,
 	}
 	for _, ddl := range indexes {
-		if _, err := w.Exec(ddl); err != nil {
+		if _, err := w.Exec(ctx, ddl); err != nil {
 			return fmt.Errorf("creating index: %w", err)
 		}
 	}
-	if err := ensureUsageIndexesLocked(w); err != nil {
+	if err := ensureUsageIndexesLocked(ctx, w); err != nil {
 		return err
 	}
 	var sourceIndexColumns sql.NullString
-	if err := w.QueryRow(`
+	if err := w.QueryRow(ctx, `
 		SELECT group_concat(name, ',')
 		FROM (
 			SELECT name
@@ -3340,7 +3657,7 @@ func (db *DB) createPartialIndexesLocked(w *writerHandle) error {
 		return fmt.Errorf("probing active session source index: %w", err)
 	}
 	var sourceIndexSQL sql.NullString
-	if err := w.QueryRow(`
+	if err := w.QueryRow(ctx, `
 		SELECT sql FROM sqlite_master
 		WHERE type = 'index' AND name = 'idx_sessions_agent_file_path_active'
 	`).Scan(&sourceIndexSQL); err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -3352,26 +3669,26 @@ func (db *DB) createPartialIndexesLocked(w *writerHandle) error {
 	if sourceIndexColumns.String != "agent,file_path,id" ||
 		!strings.Contains(normalizedSourceIndexSQL,
 			"where file_path is not null and deleted_at is null") {
-		if _, err := w.Exec(
+		if _, err := w.Exec(ctx,
 			`DROP INDEX IF EXISTS idx_sessions_agent_file_path_active`,
 		); err != nil {
 			return fmt.Errorf("dropping legacy active session source index: %w", err)
 		}
 	}
-	if _, err := w.Exec(`
+	if _, err := w.Exec(ctx, `
 		CREATE INDEX IF NOT EXISTS idx_sessions_agent_file_path_active
 		ON sessions(agent, file_path, id)
 		WHERE file_path IS NOT NULL AND deleted_at IS NULL`); err != nil {
 		return fmt.Errorf("creating active session source index: %w", err)
 	}
-	if _, err := w.Exec(
+	if _, err := w.Exec(ctx,
 		`DROP INDEX IF EXISTS idx_artifact_checkpoint_stage_pending`,
 	); err != nil {
 		return fmt.Errorf("dropping superseded artifact stage index: %w", err)
 	}
 	// Superseded by idx_recall_extract_progress_retry (schema.sql), whose
 	// trailing updated_at column serves the same prefix.
-	if _, err := w.Exec(
+	if _, err := w.Exec(ctx,
 		`DROP INDEX IF EXISTS idx_recall_extract_progress_state`,
 	); err != nil {
 		return fmt.Errorf("dropping legacy extract progress index: %w", err)
@@ -3379,12 +3696,12 @@ func (db *DB) createPartialIndexesLocked(w *writerHandle) error {
 	// Rebuild the insight lookup index so it covers date_to (added for
 	// range-aware lookups). DROP/CREATE only touches the index, never the
 	// insights rows, so this is non-destructive.
-	if _, err := w.Exec(
+	if _, err := w.Exec(ctx,
 		`DROP INDEX IF EXISTS idx_insights_lookup`,
 	); err != nil {
 		return fmt.Errorf("recreating idx_insights_lookup: %w", err)
 	}
-	if _, err := w.Exec(
+	if _, err := w.Exec(ctx,
 		`CREATE INDEX IF NOT EXISTS idx_insights_lookup
 		 ON insights(type, date_from, date_to, project)`,
 	); err != nil {
@@ -3398,9 +3715,9 @@ var usageSessionCoveringIndexColumns = []string{
 	"provider_id", "claude_message_id", "claude_request_id", "token_usage", "source_uuid",
 }
 
-func ensureUsageIndexesLocked(w *writerHandle) error {
+func ensureUsageIndexesLocked(ctx context.Context, w *writerHandle) error {
 	var supersededUsageIndex int
-	if err := w.QueryRow(`
+	if err := w.QueryRow(ctx, `
 		SELECT EXISTS(
 			SELECT 1 FROM sqlite_master
 			WHERE type = 'index' AND name = 'idx_messages_usage_covering'
@@ -3410,10 +3727,10 @@ func ensureUsageIndexesLocked(w *writerHandle) error {
 	if supersededUsageIndex != 0 {
 		log.Printf("rebuilding SQLite usage indexes; startup continues after the archive index migration completes")
 	}
-	if _, err := w.Exec(`DROP INDEX IF EXISTS idx_messages_usage_covering`); err != nil {
+	if _, err := w.Exec(ctx, `DROP INDEX IF EXISTS idx_messages_usage_covering`); err != nil {
 		return fmt.Errorf("dropping superseded usage covering index: %w", err)
 	}
-	if err := ensureUsageIndexColumnsLocked(
+	if err := ensureUsageIndexColumnsLocked(ctx,
 		w, "idx_messages_usage_timestamp", []string{"timestamp", "session_id"},
 		`CREATE INDEX IF NOT EXISTS idx_messages_usage_timestamp
 		 ON messages(timestamp, session_id)
@@ -3421,7 +3738,7 @@ func ensureUsageIndexesLocked(w *writerHandle) error {
 	); err != nil {
 		return err
 	}
-	if err := ensureUsageIndexColumnsLocked(
+	if err := ensureUsageIndexColumnsLocked(ctx,
 		w, "idx_messages_usage_session_covering", usageSessionCoveringIndexColumns,
 		`CREATE INDEX IF NOT EXISTS idx_messages_usage_session_covering
 		 ON messages(session_id, ordinal, timestamp, role, model, provider_id,
@@ -3430,7 +3747,7 @@ func ensureUsageIndexesLocked(w *writerHandle) error {
 	); err != nil {
 		return err
 	}
-	if err := ensureUsageIndexColumnsLocked(
+	if err := ensureUsageIndexColumnsLocked(ctx,
 		w, "idx_messages_activity_timestamp",
 		[]string{"timestamp", "session_id", "ordinal", "model"},
 		`CREATE INDEX IF NOT EXISTS idx_messages_activity_timestamp
@@ -3442,11 +3759,11 @@ func ensureUsageIndexesLocked(w *writerHandle) error {
 	return nil
 }
 
-func ensureUsageIndexColumnsLocked(
+func ensureUsageIndexColumnsLocked(ctx context.Context,
 	w *writerHandle, name string, want []string, ddl string,
 ) error {
 	var columns sql.NullString
-	if err := w.QueryRow(fmt.Sprintf(`
+	if err := w.QueryRow(ctx, fmt.Sprintf(`
 		SELECT group_concat(name, ',')
 		FROM (
 			SELECT name
@@ -3462,12 +3779,12 @@ func ensureUsageIndexColumnsLocked(
 				name,
 			)
 		}
-		if _, err := w.Exec(
-			`DROP INDEX IF EXISTS ` + name,
+		if _, err := w.Exec(ctx,
+			`DROP INDEX IF EXISTS `+name,
 		); err != nil {
 			return fmt.Errorf("dropping stale usage index %s: %w", name, err)
 		}
-		if _, err := w.Exec(ddl); err != nil {
+		if _, err := w.Exec(ctx, ddl); err != nil {
 			return fmt.Errorf("creating usage index %s: %w", name, err)
 		}
 	}
@@ -3481,10 +3798,24 @@ func ensureUsageIndexColumnsLocked(
 // which classifier wrote the current audit, but it is not a
 // complete integrity marker: rows can be copied from older DBs
 // or stale remote machines after the hash was stamped.
-func (db *DB) backfillIsAutomatedLocked(w *writerHandle) error {
+func (db *DB) backfillIsAutomatedLocked(ctx context.Context, w *writerHandle) error {
 	current := ClassifierHash()
+	if db.usageOnlyStorage() {
+		// Usage-only archives deliberately discard the text this migration
+		// audits. Session writes classify while raw parser/importer data is
+		// still available, so the stored flag is the durable authority here.
+		_, err := w.Exec(ctx,
+			`INSERT INTO stats (key, value) VALUES (?, ?)
+			 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+			ClassifierHashKey, current,
+		)
+		if err != nil {
+			return fmt.Errorf("storing classifier hash: %w", err)
+		}
+		return nil
+	}
 	var stored string
-	err := w.QueryRow(
+	err := w.QueryRow(ctx,
 		`SELECT value FROM stats WHERE key = ?`,
 		ClassifierHashKey,
 	).Scan(&stored)
@@ -3497,20 +3828,20 @@ func (db *DB) backfillIsAutomatedLocked(w *writerHandle) error {
 	patterns := snapshotAutomationPatterns()
 	var setIDs, clearIDs []string
 	if stored == current {
-		setIDs, clearIDs, err = auditAutomatedMatchingHash(w, patterns)
+		setIDs, clearIDs, err = auditAutomatedMatchingHash(ctx, w, patterns)
 	} else {
-		setIDs, clearIDs, err = auditAutomatedFull(w, patterns)
+		setIDs, clearIDs, err = auditAutomatedFull(ctx, w, patterns)
 	}
 	if err != nil {
 		return err
 	}
 
-	if err := batchUpdateAutomated(
+	if err := batchUpdateAutomated(ctx,
 		w, setIDs, 1,
 	); err != nil {
 		return err
 	}
-	if err := batchUpdateAutomated(
+	if err := batchUpdateAutomated(ctx,
 		w, clearIDs, 0,
 	); err != nil {
 		return err
@@ -3527,7 +3858,7 @@ func (db *DB) backfillIsAutomatedLocked(w *writerHandle) error {
 	// stats.value is INTEGER affinity; SQLite stores hex text
 	// here verbatim. Switching to STRICT tables would require
 	// moving this row to a TEXT-typed table.
-	if _, err := w.Exec(
+	if _, err := w.Exec(ctx,
 		`INSERT INTO stats (key, value) VALUES (?, ?)
 		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
 		ClassifierHashKey, current,
@@ -3546,15 +3877,15 @@ func (db *DB) backfillIsAutomatedLocked(w *writerHandle) error {
 // is idempotent, but a stats sentinel makes it run once per database: after a
 // resync (or the first populate) every row already carries the columns, so
 // later Opens skip the unindexed full-table NULL scan. Caller holds db.mu.
-func (db *DB) backfillToolCallFieldsLocked(w *writerHandle) error {
-	should, err := db.shouldRunToolCallFieldBackfillLocked(w)
+func (db *DB) backfillToolCallFieldsLocked(ctx context.Context, w *writerHandle) error {
+	should, err := db.shouldRunToolCallFieldBackfillLocked(ctx, w)
 	if err != nil {
 		return err
 	}
 	if !should {
 		return nil
 	}
-	if _, err := w.Exec(`
+	if _, err := w.Exec(ctx, `
 		UPDATE tool_calls
 		SET file_path = COALESCE(
 			json_extract(input_json,'$.file_path'),
@@ -3567,7 +3898,7 @@ func (db *DB) backfillToolCallFieldsLocked(w *writerHandle) error {
 		  AND json_valid(input_json)`); err != nil {
 		return fmt.Errorf("backfilling tool_calls.file_path: %w", err)
 	}
-	if _, err := w.Exec(`
+	if _, err := w.Exec(ctx, `
 		UPDATE tool_calls
 		SET call_index = (
 			SELECT COUNT(*) FROM tool_calls t2
@@ -3576,17 +3907,17 @@ func (db *DB) backfillToolCallFieldsLocked(w *writerHandle) error {
 		WHERE call_index IS NULL`); err != nil {
 		return fmt.Errorf("backfilling tool_calls.call_index: %w", err)
 	}
-	return db.markToolCallFieldBackfillDoneLocked(w)
+	return db.markToolCallFieldBackfillDoneLocked(ctx, w)
 }
 
 // shouldRunToolCallFieldBackfillLocked reports whether the one-time
 // tool_calls file_path/call_index backfill still needs to run. Caller holds
 // db.mu.
-func (db *DB) shouldRunToolCallFieldBackfillLocked(
+func (db *DB) shouldRunToolCallFieldBackfillLocked(ctx context.Context,
 	w *writerHandle,
 ) (bool, error) {
 	var done int
-	if err := w.QueryRow(
+	if err := w.QueryRow(ctx,
 		`SELECT count(*)
 		 FROM stats
 		 WHERE key = ? AND value != 0`,
@@ -3601,10 +3932,10 @@ func (db *DB) shouldRunToolCallFieldBackfillLocked(
 
 // markToolCallFieldBackfillDoneLocked records that the one-time tool_calls
 // field backfill has completed so later Opens skip it. Caller holds db.mu.
-func (db *DB) markToolCallFieldBackfillDoneLocked(
+func (db *DB) markToolCallFieldBackfillDoneLocked(ctx context.Context,
 	w *writerHandle,
 ) error {
-	if _, err := w.Exec(
+	if _, err := w.Exec(ctx,
 		`INSERT INTO stats (key, value)
 		 VALUES (?, 1)
 		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
@@ -3624,11 +3955,11 @@ func (db *DB) markToolCallFieldBackfillDoneLocked(
 // classifier set; the temp DB's at-Open backfill already ran on
 // an empty table and stamped the current hash, so without this
 // call those rows would be permanently stuck with stale flags.
-func (db *DB) ForceBackfillIsAutomated() error {
+func (db *DB) ForceBackfillIsAutomated(ctx context.Context) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	w := db.getWriter()
-	if _, err := w.Exec(
+	if _, err := w.Exec(ctx,
 		`DELETE FROM stats WHERE key = ?`,
 		ClassifierHashKey,
 	); err != nil {
@@ -3636,10 +3967,10 @@ func (db *DB) ForceBackfillIsAutomated() error {
 			"clearing classifier hash: %w", err,
 		)
 	}
-	return db.backfillIsAutomatedLocked(w)
+	return db.backfillIsAutomatedLocked(ctx, w)
 }
 
-func batchUpdateAutomated(
+func batchUpdateAutomated(ctx context.Context,
 	w *writerHandle, ids []string, val int,
 ) error {
 	const batchSize = 500
@@ -3653,7 +3984,7 @@ func batchUpdateAutomated(
 			args[j+1] = id
 			phs[j] = "?"
 		}
-		_, err := w.Exec(
+		_, err := w.Exec(ctx,
 			"UPDATE sessions"+
 				" SET is_automated = ?,"+
 				"     local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')"+
@@ -3671,11 +4002,11 @@ func batchUpdateAutomated(
 	return nil
 }
 
-func (db *DB) shouldRunTokenCoverageRepairLocked(
+func (db *DB) shouldRunTokenCoverageRepairLocked(ctx context.Context,
 	w *writerHandle,
 ) (bool, error) {
 	var done int
-	if err := w.QueryRow(
+	if err := w.QueryRow(ctx,
 		`SELECT count(*)
 		 FROM stats
 		 WHERE key = ? AND value != 0`,
@@ -3688,10 +4019,10 @@ func (db *DB) shouldRunTokenCoverageRepairLocked(
 	return done == 0, nil
 }
 
-func (db *DB) markTokenCoverageRepairDoneLocked(
+func (db *DB) markTokenCoverageRepairDoneLocked(ctx context.Context,
 	w *writerHandle,
 ) error {
-	if _, err := w.Exec(
+	if _, err := w.Exec(ctx,
 		`INSERT INTO stats (key, value)
 		 VALUES (?, 1)
 		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
@@ -3704,14 +4035,14 @@ func (db *DB) markTokenCoverageRepairDoneLocked(
 	return nil
 }
 
-func (db *DB) backfillTokenCoverageFlagsLocked(
+func (db *DB) backfillTokenCoverageFlagsLocked(ctx context.Context,
 	w *writerHandle,
 ) error {
-	msgUpdates, err := db.backfillMessageTokenCoverageLocked(w)
+	msgUpdates, err := db.backfillMessageTokenCoverageLocked(ctx, w)
 	if err != nil {
 		return err
 	}
-	sessUpdates, err := db.backfillSessionTokenCoverageLocked(w)
+	sessUpdates, err := db.backfillSessionTokenCoverageLocked(ctx, w)
 	if err != nil {
 		return err
 	}
@@ -3724,10 +4055,10 @@ func (db *DB) backfillTokenCoverageFlagsLocked(
 	return nil
 }
 
-func (db *DB) backfillMessageTokenCoverageLocked(
+func (db *DB) backfillMessageTokenCoverageLocked(ctx context.Context,
 	w *writerHandle,
 ) (int, error) {
-	candidates, err := db.messageTokenCoverageBackfillCandidatesLocked(w)
+	candidates, err := db.messageTokenCoverageBackfillCandidatesLocked(ctx, w)
 	if err != nil {
 		return 0, err
 	}
@@ -3735,7 +4066,7 @@ func (db *DB) backfillMessageTokenCoverageLocked(
 		return 0, nil
 	}
 
-	tx, err := w.Begin()
+	tx, err := w.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf(
 			"beginning message token backfill transaction: %w", err,
@@ -3743,7 +4074,7 @@ func (db *DB) backfillMessageTokenCoverageLocked(
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	stmt, err := tx.Prepare(
+	stmt, err := tx.PrepareContext(ctx,
 		`UPDATE messages
 		 SET has_context_tokens = ?, has_output_tokens = ?
 		 WHERE id = ?`,
@@ -3757,7 +4088,7 @@ func (db *DB) backfillMessageTokenCoverageLocked(
 
 	sessions := make(map[string]struct{})
 	for _, candidate := range candidates {
-		if _, err := stmt.Exec(
+		if _, err := stmt.ExecContext(ctx,
 			candidate.hasContext, candidate.hasOutput, candidate.id,
 		); err != nil {
 			return 0, fmt.Errorf(
@@ -3781,10 +4112,10 @@ func (db *DB) backfillMessageTokenCoverageLocked(
 	return len(candidates), nil
 }
 
-func (db *DB) messageTokenCoverageBackfillCandidatesLocked(
+func (db *DB) messageTokenCoverageBackfillCandidatesLocked(ctx context.Context,
 	w *writerHandle,
 ) ([]messageTokenCoverageBackfillCandidate, error) {
-	rows, err := w.Query(
+	rows, err := w.Query(ctx,
 		`SELECT id, session_id, token_usage, context_tokens, output_tokens,
 			has_context_tokens, has_output_tokens
 		 FROM messages
@@ -3846,10 +4177,10 @@ type messageTokenCoverageBackfillCandidate struct {
 
 const tokenCoverageBackfillBatchSize = 1000
 
-func (db *DB) backfillSessionTokenCoverageLocked(
+func (db *DB) backfillSessionTokenCoverageLocked(ctx context.Context,
 	w *writerHandle,
 ) (int, error) {
-	candidates, err := db.loadSessionCoverageCandidates(w)
+	candidates, err := db.loadSessionCoverageCandidates(ctx, w)
 	if err != nil {
 		return 0, err
 	}
@@ -3857,7 +4188,7 @@ func (db *DB) backfillSessionTokenCoverageLocked(
 		return 0, nil
 	}
 
-	msgCoverage, err := db.batchLoadMessageCoverage(
+	msgCoverage, err := db.batchLoadMessageCoverage(ctx,
 		w, candidates,
 	)
 	if err != nil {
@@ -3870,13 +4201,13 @@ func (db *DB) backfillSessionTokenCoverageLocked(
 	if len(updates) == 0 {
 		return 0, nil
 	}
-	return db.applySessionCoverageUpdates(w, updates)
+	return db.applySessionCoverageUpdates(ctx, w, updates)
 }
 
-func (db *DB) loadSessionCoverageCandidates(
+func (db *DB) loadSessionCoverageCandidates(ctx context.Context,
 	w *writerHandle,
 ) ([]SessionCoverageCandidate, error) {
-	rows, err := w.Query(
+	rows, err := w.Query(ctx,
 		`SELECT id, total_output_tokens, peak_context_tokens,
 			has_total_output_tokens, has_peak_context_tokens
 		 FROM sessions
@@ -3910,67 +4241,74 @@ func (db *DB) loadSessionCoverageCandidates(
 	return candidates, nil
 }
 
-func (db *DB) batchLoadMessageCoverage(
+func (db *DB) batchLoadMessageCoverage(ctx context.Context,
 	w *writerHandle,
 	candidates []SessionCoverageCandidate,
 ) (map[string][2]bool, error) {
 	coverage := map[string][2]bool{}
 	for start := 0; start < len(candidates); start += tokenCoverageBackfillBatchSize {
-		end := min(
-			start+tokenCoverageBackfillBatchSize,
-			len(candidates),
-		)
-		batch := candidates[start:end]
-		args := make([]any, len(batch))
-		placeholders := make([]string, len(batch))
-		for i, c := range batch {
-			args[i] = c.ID
-			placeholders[i] = "?"
-		}
-		rows, err := w.Query(
-			`SELECT session_id, has_context_tokens,
+		if err := func() error {
+			end := min(
+				start+tokenCoverageBackfillBatchSize,
+				len(candidates),
+			)
+			batch := candidates[start:end]
+			args := make([]any, len(batch))
+			placeholders := make([]string, len(batch))
+			for i, c := range batch {
+				args[i] = c.ID
+				placeholders[i] = "?"
+			}
+			rows, err := w.Query(ctx,
+				`SELECT session_id, has_context_tokens,
 				has_output_tokens
 			 FROM messages
 			 WHERE session_id IN (`+strings.Join(placeholders, ",")+`)`,
-			args...,
-		)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"querying message coverage: %w", err,
+				args...,
 			)
-		}
-		for rows.Next() {
-			var sessionID string
-			var hasContext, hasOutput bool
-			if err := rows.Scan(
-				&sessionID, &hasContext, &hasOutput,
-			); err != nil {
-				rows.Close()
-				return nil, fmt.Errorf(
-					"scanning message coverage: %w", err,
+			if err != nil {
+				return fmt.Errorf(
+					"querying message coverage: %w", err,
 				)
 			}
-			entry := coverage[sessionID]
-			entry[0] = entry[0] || hasContext
-			entry[1] = entry[1] || hasOutput
-			coverage[sessionID] = entry
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		if err := rows.Close(); err != nil {
+			defer rows.Close()
+			for rows.Next() {
+				var sessionID string
+				var hasContext, hasOutput bool
+				if err := rows.Scan(
+					&sessionID, &hasContext, &hasOutput,
+				); err != nil {
+					rows.Close()
+					return fmt.Errorf(
+						"scanning message coverage: %w", err,
+					)
+				}
+				entry := coverage[sessionID]
+				entry[0] = entry[0] || hasContext
+				entry[1] = entry[1] || hasOutput
+				coverage[sessionID] = entry
+			}
+			if err := rows.Err(); err != nil {
+				rows.Close()
+				return err
+			}
+			if err := rows.Close(); err != nil {
+				return err
+			}
+
+			return nil
+		}(); err != nil {
 			return nil, err
 		}
 	}
 	return coverage, nil
 }
 
-func (db *DB) applySessionCoverageUpdates(
+func (db *DB) applySessionCoverageUpdates(ctx context.Context,
 	w *writerHandle,
 	updates []SessionCoverageUpdate,
 ) (int, error) {
-	tx, err := w.Begin()
+	tx, err := w.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf(
 			"beginning session token backfill transaction: %w",
@@ -3985,7 +4323,7 @@ func (db *DB) applySessionCoverageUpdates(
 	// sync_marker signal, so this one-time repair would otherwise leave
 	// already-pushed rows stale until an unrelated change re-selected them
 	// (see updateSessionSignalsTx for the same pattern).
-	stmt, err := tx.Prepare(
+	stmt, err := tx.PrepareContext(ctx,
 		`UPDATE sessions
 		 SET has_total_output_tokens = ?,
 		     has_peak_context_tokens = ?,
@@ -4000,7 +4338,7 @@ func (db *DB) applySessionCoverageUpdates(
 	defer stmt.Close()
 
 	for _, u := range updates {
-		if _, err := stmt.Exec(
+		if _, err := stmt.ExecContext(ctx,
 			u.HasTotal, u.HasPeak, u.ID,
 		); err != nil {
 			return 0, fmt.Errorf(
@@ -4045,10 +4383,10 @@ func CurrentDataVersion() int {
 // (joined on rowid). The bundled SQLite preserves rowids through VACUUM, so
 // no FTS rebuild is needed; TestVacuumPreservesRecallEntriesFTSSearchable guards
 // that assumption and will fail if a future SQLite bump changes it.
-func (db *DB) Vacuum() error {
+func (db *DB) Vacuum(ctx context.Context) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	_, err := db.getWriter().Exec("VACUUM")
+	_, err := db.getWriter().Exec(ctx, "VACUUM")
 	return err
 }
 
@@ -4056,11 +4394,12 @@ func openAndInit(
 	ctx context.Context,
 	path string,
 	schemaRepairNeeded, backgroundMaintenance bool,
+	progress OpenProgressFunc,
 ) (*DB, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	writer, err := sql.Open("sqlite3", makeDSN(path, false))
+	writer, err := sql.Open(sqliteArchiveDriverName, makeDSN(path, false))
 	if err != nil {
 		return nil, fmt.Errorf("opening writer: %w", err)
 	}
@@ -4070,7 +4409,7 @@ func openAndInit(
 		return nil, fmt.Errorf("configuring wal: %w", err)
 	}
 
-	reader, err := sql.Open(sqliteUsageDriverName, makeDSN(path, true))
+	reader, err := sql.Open(sqliteArchiveDriverName, makeDSN(path, true))
 	if err != nil {
 		writer.Close()
 		return nil, fmt.Errorf("opening reader: %w", err)
@@ -4091,12 +4430,13 @@ func openAndInit(
 		)
 	}
 	if schemaRepairNeeded {
+		progress.report("Repairing database schema")
 		if err := ctx.Err(); err != nil {
 			_ = db.CloseContext(ctx)
 			return nil, err
 		}
 		db.mu.Lock()
-		err = repairLegacySchemaBeforeInit(ctx, db.getWriter())
+		err = repairLegacySchemaBeforeInit(ctx, db.getWriter(), progress)
 		db.mu.Unlock()
 		if err != nil {
 			_ = db.CloseContext(ctx)
@@ -4110,7 +4450,17 @@ func openAndInit(
 		_ = db.CloseContext(ctx)
 		return nil, err
 	}
-	if err := db.init(ctx); err != nil {
+	db.mu.Lock()
+	err = migrateRecallReviewStateConstraintLocked(ctx, db.getWriter())
+	db.mu.Unlock()
+	if err != nil {
+		_ = db.CloseContext(ctx)
+		return nil, fmt.Errorf(
+			"migrating recall review state: %w", err,
+		)
+	}
+
+	if err := db.init(ctx, progress); err != nil {
 		_ = db.CloseContext(ctx)
 		return nil, fmt.Errorf("initializing schema: %w", err)
 	}
@@ -4161,28 +4511,22 @@ func (db *DB) CheckpointWALTruncate(ctx context.Context) error {
 // pages after large rewrites such as a full resync. Persistent readers simply
 // leave the WAL for the next periodic attempt.
 func (db *DB) CheckpointWALTruncateWithRetry(ctx context.Context) error {
-	var lastErr error
-	for i := range walCheckpointAttempts {
+	_, err := backoff.Retry(ctx, func() (struct{}, error) {
 		err := db.CheckpointWALTruncate(ctx)
-		if err == nil {
-			return nil
+		if err != nil && !errors.Is(err, ErrWALCheckpointBusy) {
+			err = backoff.Permanent(err)
 		}
-		lastErr = err
-		if !errors.Is(err, ErrWALCheckpointBusy) {
-			return err
-		}
-		if i == walCheckpointAttempts-1 {
-			break
-		}
-		timer := time.NewTimer(walCheckpointRetryDelay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
+		return struct{}{}, err
+	}, backoff.WithBackOff(backoff.NewConstantBackOff(walCheckpointRetryDelay)),
+		backoff.WithMaxTries(walCheckpointAttempts), backoff.WithMaxElapsedTime(0))
+	if err == nil {
+		return nil
 	}
-	return lastErr
+	retryErr := backoff.AsRetryError(err)
+	if errors.Is(retryErr.Cause, backoff.ErrPermanent) || errors.Is(retryErr.Cause, backoff.ErrExhausted) {
+		return retryErr.LastErr
+	}
+	return ctx.Err()
 }
 
 // MaybeCheckpointLargeWAL attempts a truncate checkpoint only when the WAL file
@@ -4216,14 +4560,11 @@ func (db *DB) startWALCheckpointLoop() {
 		defer close(done)
 		ticker := time.NewTicker(walCheckpointInterval)
 		defer ticker.Stop()
+		var diag walDiagnostics
 		for {
 			select {
 			case <-ticker.C:
-				attempted, err := db.MaybeCheckpointLargeWAL(context.Background())
-				if attempted && err != nil &&
-					!errors.Is(err, ErrWALCheckpointBusy) {
-					log.Printf("sqlite wal checkpoint: %v", err)
-				}
+				db.walMaintenanceTick(context.Background(), &diag)
 			case <-stop:
 				return
 			}
@@ -4249,10 +4590,17 @@ func (db *DB) stopWALCheckpointLoop() {
 // DropFTS drops the FTS table and its triggers. This makes
 // bulk message delete+reinsert fast by avoiding per-row FTS
 // index updates. Call RebuildFTS after to restore search.
-func (db *DB) DropFTS() error {
+func (db *DB) DropFTS(ctx context.Context) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	stmts := []string{
+		"DROP TRIGGER IF EXISTS messages_cjk_ai",
+		"DROP TRIGGER IF EXISTS messages_cjk_ad",
+		"DROP TRIGGER IF EXISTS messages_cjk_au",
+		"DROP TRIGGER IF EXISTS sessions_cjk_pending_ai",
+		"DROP TRIGGER IF EXISTS sessions_cjk_pending_au",
+		"DROP TRIGGER IF EXISTS sessions_cjk_pending_ad",
+		"DROP TABLE IF EXISTS messages_cjk_fts",
 		"DROP TRIGGER IF EXISTS messages_ai",
 		"DROP TRIGGER IF EXISTS messages_ad",
 		"DROP TRIGGER IF EXISTS messages_au",
@@ -4260,67 +4608,173 @@ func (db *DB) DropFTS() error {
 	}
 	w := db.getWriter()
 	for _, s := range stmts {
-		if _, err := w.Exec(s); err != nil {
+		if _, err := w.Exec(ctx, s); err != nil {
 			return fmt.Errorf("drop fts (%s): %w", s, err)
 		}
+	}
+	if _, err := w.Exec(ctx,
+		"DELETE FROM stats WHERE key = ?", cjkFTSFingerprintStatsKey,
+	); err != nil {
+		return fmt.Errorf("clearing CJK fts fingerprint: %w", err)
 	}
 	return nil
 }
 
 // RebuildFTS recreates the FTS table, triggers, and
 // repopulates the index from the messages table.
-func (db *DB) RebuildFTS() error {
+func (db *DB) RebuildFTS(ctx context.Context) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	w := db.getWriter()
-	if _, err := w.Exec(schemaFTS); err != nil {
+	if _, err := w.Exec(ctx, schemaFTS); err != nil {
 		return fmt.Errorf("recreate fts: %w", err)
 	}
-	_, err := w.Exec(
-		"INSERT INTO messages_fts(messages_fts)" +
+	_, err := w.Exec(ctx,
+		"INSERT INTO messages_fts(messages_fts)"+
 			" VALUES('rebuild')",
 	)
 	if err != nil {
 		return fmt.Errorf("rebuild fts index: %w", err)
 	}
+	if err := ensureCJKFTS(ctx, w, true); err != nil {
+		return fmt.Errorf("rebuild CJK fts index: %w", err)
+	}
 	return nil
 }
 
-// DropUsageMessageIndexes drops the archive usage and activity
-// message indexes so bulk message loads avoid per-row B-tree
-// maintenance. Call RebuildUsageMessageIndexes before the archive
-// is served again: read-only opens require these indexes.
-func (db *DB) DropUsageMessageIndexes() error {
+// bulkImportWALAutocheckpointBytes is the WAL growth between automatic
+// checkpoints in a disposable resync archive. Tests shrink it.
+var bulkImportWALAutocheckpointBytes = 128 << 20
+
+func bulkImportWALAutocheckpointPages(pageSize int) int {
+	return max(1, bulkImportWALAutocheckpointBytes/pageSize)
+}
+
+// DropBulkImportIndexes omits derived index maintenance in a disposable
+// full-resync archive and defers its automatic WAL checkpoints.
+// RebuildBulkImportIndexes and CheckpointWALTruncate must succeed before the swap.
+func (db *DB) DropBulkImportIndexes(ctx context.Context) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	w := db.getWriter()
+	var pageSize int
+	if err := w.QueryRow(ctx, "PRAGMA page_size").Scan(&pageSize); err != nil {
+		return fmt.Errorf("reading page_size: %w", err)
+	}
+	// This policy belongs to the disposable writer connection and ends on close.
+	if _, err := w.Exec(ctx, fmt.Sprintf("PRAGMA wal_autocheckpoint = %d",
+		bulkImportWALAutocheckpointPages(pageSize))); err != nil {
+		return fmt.Errorf("setting wal_autocheckpoint: %w", err)
+	}
 	for _, name := range []string{
 		"idx_messages_usage_timestamp",
 		"idx_messages_usage_session_covering",
 		"idx_messages_activity_timestamp",
+		"idx_tool_calls_session_tool_use",
+		"idx_tool_result_events_identity",
+		"idx_tool_result_events_summary",
 	} {
-		if _, err := w.Exec(`DROP INDEX IF EXISTS ` + name); err != nil {
-			return fmt.Errorf("dropping usage index %s: %w", name, err)
+		if _, err := w.Exec(ctx, `DROP INDEX IF EXISTS `+name); err != nil {
+			return fmt.Errorf("dropping bulk import index %s: %w", name, err)
 		}
 	}
 	return nil
 }
 
-// RebuildUsageMessageIndexes recreates the archive usage and
-// activity message indexes after a bulk load that dropped them.
-func (db *DB) RebuildUsageMessageIndexes() error {
+// RebuildBulkImportIndexes creates each deferred B-tree once after the bulk
+// load. Source archives and live incremental writers never drop these indexes.
+func (db *DB) RebuildBulkImportIndexes(ctx context.Context) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	return ensureUsageIndexesLocked(db.getWriter())
+	if err := ensureUsageIndexesLocked(ctx, db.getWriter()); err != nil {
+		return err
+	}
+	for _, query := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_tool_calls_session_tool_use
+		 ON tool_calls(session_id, tool_use_id) WHERE tool_use_id IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_tool_result_events_identity
+		 ON tool_result_events(session_id, tool_call_message_ordinal, call_index,
+		 agent_id, status, raw_content_digest) WHERE raw_content_digest IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_tool_result_events_summary
+		 ON tool_result_events(session_id, tool_call_message_ordinal, call_index,
+		 (summary_participates IS NULL OR raw_content_digest IS NULL),
+		 summary_participates, event_index)`,
+	} {
+		if _, err := db.getWriter().Exec(ctx, query); err != nil {
+			return fmt.Errorf("rebuilding tool result import indexes: %w", err)
+		}
+	}
+	return nil
+}
+
+// checkFTSModuleLoads fails when messages_fts is in the schema but this
+// executable's SQLite cannot load its virtual table module. Writes to
+// messages fire triggers into messages_fts, so such an archive is
+// read-only for this build no matter how the open succeeds.
+func (db *DB) checkFTSModuleLoads(
+	ctx context.Context, w *writerHandle,
+) error {
+	_, err := w.ExecContext(ctx, "SELECT 1 FROM messages_fts LIMIT 1")
+	if err == nil {
+		return nil
+	}
+	// The statement is fixed and the table row exists, so a generic
+	// SQLITE_ERROR here is the schema failing to load its module. I/O,
+	// corruption, and busy failures carry their own codes.
+	sqliteErr, ok := errors.AsType[sqlite3.Error](err)
+	if !ok || sqliteErr.Code != sqlite3.ErrError {
+		return nil
+	}
+	return fmt.Errorf(
+		"archive %s has a full-text index this executable cannot load"+
+			" (%w); rebuild agentsview with CGO_ENABLED=1 -tags fts5"+
+			" so SQLite is compiled with SQLITE_ENABLE_FTS5",
+		db.path, err,
+	)
 }
 
 // HasFTS checks if Full Text Search is available.
-func (db *DB) HasFTS() bool {
+func (db *DB) HasFTS(ctx context.Context) bool {
 	// We need to actually try to access the table, because it might exist
 	// in sqlite_master but fail to load if the fts5 module is missing
 	// in the current runtime.
-	_, err := db.getReader().Exec(
+	_, err := db.getReader().Exec(ctx,
 		"SELECT 1 FROM messages_fts LIMIT 1",
+	)
+	return err == nil
+}
+
+// HasCJKFTS reports whether the optional simple-tokenized message index is
+// loaded and queryable on this database connection.
+func (db *DB) HasCJKFTS(ctx context.Context) (available bool) {
+	if !simpleFTSRuntimeConfig.available() {
+		return false
+	}
+	defer func() {
+		if !available {
+			db.cjkFTSUnavailableLog.Do(func() {
+				log.Print("CJK FTS unavailable or stale; using standard FTS5 until the archive is reopened")
+			})
+		}
+	}()
+	var storedFingerprint string
+	if err := db.getReader().QueryRow(ctx,
+		"SELECT CAST(value AS TEXT) FROM stats WHERE key = ?",
+		cjkFTSFingerprintStatsKey,
+	).Scan(&storedFingerprint); err != nil ||
+		storedFingerprint != simpleFTSRuntimeConfig.fingerprint {
+		return false
+	}
+	var hasPendingSessions bool
+	if err := db.getReader().QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM messages_cjk_fts_pending_sessions LIMIT 1
+		)`,
+	).Scan(&hasPendingSessions); err != nil || hasPendingSessions {
+		return false
+	}
+	_, err := db.getReader().Exec(ctx,
+		"SELECT 1 FROM messages_cjk_fts LIMIT 1",
 	)
 	return err == nil
 }
@@ -4353,10 +4807,11 @@ func (db *DB) setDataVersion(ctx context.Context) error {
 	return nil
 }
 
-func (db *DB) init(ctx context.Context) error {
+func (db *DB) init(ctx context.Context, progress OpenProgressFunc) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	w := db.getWriter()
+	progress.report("Updating database schema and indexes")
 	if err := execSchemaScriptLocked(ctx, w); err != nil {
 		return err
 	}
@@ -4376,6 +4831,14 @@ func (db *DB) init(ctx context.Context) error {
 		); err != nil {
 			return fmt.Errorf("adding result_content column: %w", err)
 		}
+	}
+
+	progress.report("Initializing full-text search")
+	var fts5Available bool
+	if err := w.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pragma_module_list WHERE name = 'fts5')`,
+	).Scan(&fts5Available); err != nil {
+		return fmt.Errorf("checking full-text search modules: %w", err)
 	}
 
 	// Check if FTS table exists before trying to create it
@@ -4420,12 +4883,18 @@ func (db *DB) init(ctx context.Context) error {
 	// Attempt to initialize FTS. Failure is non-fatal
 	// (might be missing module).
 	if _, err := w.ExecContext(ctx, schemaFTS); err != nil {
-		if !strings.Contains(
-			err.Error(), "no such module",
-		) {
+		if fts5Available {
 			return fmt.Errorf("initializing FTS: %w", err)
 		}
-	} else if !hadFTS {
+	} else if hadFTS {
+		// IF NOT EXISTS skips the module lookup for an existing
+		// table, so an archive indexed by an fts5 build opens on an
+		// executable without fts5 and every message write then fails
+		// inside the messages triggers. Refuse the open instead.
+		if err := db.checkFTSModuleLoads(ctx, w); err != nil {
+			return err
+		}
+	} else {
 		// Schema init succeeded and we didn't have FTS
 		// before. Populate the index for existing messages.
 		if _, err := w.ExecContext(ctx,
@@ -4434,6 +4903,10 @@ func (db *DB) init(ctx context.Context) error {
 		); err != nil {
 			return fmt.Errorf("backfilling FTS: %w", err)
 		}
+	}
+
+	if err := ensureCJKFTS(ctx, w, false); err != nil {
+		return fmt.Errorf("initializing CJK FTS: %w", err)
 	}
 
 	var recallFTSCount int
@@ -4445,25 +4918,7 @@ func (db *DB) init(ctx context.Context) error {
 	}
 	hadRecallFTS := recallFTSCount > 0
 	if _, err := w.ExecContext(ctx, recallEntriesFTS); err != nil {
-		if !strings.Contains(
-			err.Error(), "no such module",
-		) {
-			return fmt.Errorf("initializing recall entries FTS: %w", err)
-		}
-		if _, err := w.ExecContext(ctx, recallEntriesFTS4); err != nil {
-			if !strings.Contains(
-				err.Error(), "no such module",
-			) {
-				return fmt.Errorf("initializing recall entries FTS4: %w", err)
-			}
-		} else if !hadRecallFTS {
-			if _, err := w.ExecContext(ctx,
-				"INSERT INTO recall_entries_fts(rowid, title, body, trigger)"+
-					" SELECT rowid, title, body, trigger FROM recall_entries",
-			); err != nil {
-				return fmt.Errorf("backfilling recall entries FTS4: %w", err)
-			}
-		}
+		return fmt.Errorf("initializing recall entries FTS5 (build with -tags fts5): %w", err)
 	} else if !hadRecallFTS {
 		if _, err := w.ExecContext(ctx,
 			"INSERT INTO recall_entries_fts(recall_entries_fts)"+
@@ -4482,29 +4937,7 @@ func (db *DB) init(ctx context.Context) error {
 	}
 	hadRecallEvidenceFTS := recallEvidenceFTSCount > 0
 	if _, err := w.ExecContext(ctx, recallEvidenceFTS); err != nil {
-		if !strings.Contains(
-			err.Error(), "no such module",
-		) {
-			return fmt.Errorf("initializing recall evidence FTS: %w", err)
-		}
-		if _, err := w.ExecContext(ctx, recallEvidenceFTS4); err != nil {
-			if !strings.Contains(
-				err.Error(), "no such module",
-			) {
-				return fmt.Errorf(
-					"initializing recall evidence FTS4: %w", err,
-				)
-			}
-		} else if !hadRecallEvidenceFTS {
-			if _, err := w.ExecContext(ctx,
-				"INSERT INTO recall_evidence_fts(rowid, snippet)"+
-					" SELECT id, snippet FROM recall_evidence",
-			); err != nil {
-				return fmt.Errorf(
-					"backfilling recall evidence FTS4: %w", err,
-				)
-			}
-		}
+		return fmt.Errorf("initializing recall evidence FTS5 (build with -tags fts5): %w", err)
 	} else if !hadRecallEvidenceFTS {
 		if _, err := w.ExecContext(ctx,
 			"INSERT INTO recall_evidence_fts(recall_evidence_fts)"+
@@ -4620,7 +5053,7 @@ func SetCloseDrainTimeoutForTest(d time.Duration) (restore func()) {
 // so renaming over the file fails while any such handle survives. Because
 // this method's contract is that the file can be renamed afterwards, it
 // waits (bounded) for every closed pool to drain before returning.
-func (db *DB) CloseConnections() error {
+func (db *DB) CloseConnections(ctx context.Context) error {
 	if db.readOnly {
 		return ErrReadOnly
 	}
@@ -4628,14 +5061,14 @@ func (db *DB) CloseConnections() error {
 	db.stopWALCheckpointLoop()
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	return db.closeConnectionsLocked()
+	return db.closeConnectionsLocked(ctx)
 }
 
 // closeConnectionsLocked closes both connection pools without acquiring
 // db.mu. The caller must hold db.mu for the whole close-and-drain interval.
 // Keeping that lock held is important for staged database replacement: no
 // writer can reopen a fresh pool between the close and the file swap.
-func (db *DB) closeConnectionsLocked() error {
+func (db *DB) closeConnectionsLocked(ctx context.Context) error {
 	db.connMu.Lock()
 
 	// Close the writer last: SQLite checkpoints and removes the WAL when
@@ -4691,7 +5124,7 @@ func (db *DB) closeConnectionsLocked() error {
 	// committed writes still sitting in the log must be folded into the main
 	// file before this method reports success.
 	if w == nil && errors.Join(errs...) == nil {
-		if cerr := checkpointWALWithoutWriter(db.path); cerr != nil {
+		if cerr := checkpointWALWithoutWriter(ctx, db.path); cerr != nil {
 			errs = append(errs, cerr)
 		}
 	}
@@ -4703,20 +5136,20 @@ func (db *DB) closeConnectionsLocked() error {
 // writer pool was already closed by a write barrier. Closing the connection
 // afterwards removes the truncated sidecars, restoring the writer-last close
 // posture the method's contract promises.
-func checkpointWALWithoutWriter(path string) error {
+func checkpointWALWithoutWriter(ctx context.Context, path string) error {
 	if _, err := os.Stat(path + "-wal"); err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
 		return fmt.Errorf("stat wal before final checkpoint: %w", err)
 	}
-	conn, err := sql.Open("sqlite3", makeDSN(path, false))
+	conn, err := sql.Open(sqliteArchiveDriverName, makeDSN(path, false))
 	if err != nil {
 		return fmt.Errorf("opening final checkpoint connection: %w", err)
 	}
 	defer conn.Close()
 	var busy, logPages, checkpointedPages int
-	if err := conn.QueryRow(
+	if err := conn.QueryRowContext(ctx,
 		"PRAGMA wal_checkpoint(TRUNCATE)",
 	).Scan(&busy, &logPages, &checkpointedPages); err != nil {
 		return fmt.Errorf("final wal checkpoint: %w", err)
@@ -4799,7 +5232,7 @@ func (db *DB) reopenLocked() error {
 // other caller clears the barrier.
 func (db *DB) reopenLockedWithBarrier(keepWriterBarrier bool) error {
 	writer, err := sql.Open(
-		"sqlite3", makeDSN(db.path, false),
+		sqliteArchiveDriverName, makeDSN(db.path, false),
 	)
 	if err != nil {
 		return fmt.Errorf("reopening writer: %w", err)
@@ -4809,9 +5242,13 @@ func (db *DB) reopenLockedWithBarrier(keepWriterBarrier bool) error {
 		writer.Close()
 		return fmt.Errorf("configuring reopened wal: %w", err)
 	}
+	if err := installCJKFTSTriggers(writer); err != nil {
+		writer.Close()
+		return fmt.Errorf("configuring reopened writer: %w", err)
+	}
 
 	reader, err := sql.Open(
-		sqliteUsageDriverName, makeDSN(db.path, true),
+		sqliteArchiveDriverName, makeDSN(db.path, true),
 	)
 	if err != nil {
 		writer.Close()
@@ -4931,7 +5368,7 @@ func (db *DB) ReopenWriter() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	writer, err := sql.Open("sqlite3", makeDSN(db.path, false))
+	writer, err := sql.Open(sqliteArchiveDriverName, makeDSN(db.path, false))
 	if err != nil {
 		return fmt.Errorf("reopening writer: %w", err)
 	}
@@ -4939,6 +5376,10 @@ func (db *DB) ReopenWriter() error {
 	if err := configureWAL(writer); err != nil {
 		writer.Close()
 		return fmt.Errorf("configuring reopened wal: %w", err)
+	}
+	if err := installCJKFTSTriggers(writer); err != nil {
+		writer.Close()
+		return fmt.Errorf("configuring reopened writer: %w", err)
 	}
 
 	db.connMu.Lock()
@@ -4965,7 +5406,7 @@ func (db *DB) WriterClosed() bool {
 // Update executes fn within a write lock and transaction.
 // The transaction is committed if fn returns nil, rolled back
 // otherwise.
-func (db *DB) Update(fn func(tx *sql.Tx) error) error {
+func (db *DB) Update(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -4975,7 +5416,7 @@ func (db *DB) Update(fn func(tx *sql.Tx) error) error {
 	if db.writerClosed.Load() {
 		return ErrWriterClosed
 	}
-	tx, err := db.getWriter().Begin()
+	tx, err := db.getWriter().Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("beginning transaction: %w", err)
 	}
@@ -4993,9 +5434,9 @@ func (db *DB) Reader() Reader {
 }
 
 // GetSyncState reads a value from the pg_sync_state table.
-func (db *DB) GetSyncState(key string) (string, error) {
+func (db *DB) GetSyncState(ctx context.Context, key string) (string, error) {
 	var value string
-	err := db.getReader().QueryRow(
+	err := db.getReader().QueryRow(ctx,
 		"SELECT value FROM pg_sync_state WHERE key = ?", key,
 	).Scan(&value)
 	if err == sql.ErrNoRows {
@@ -5005,10 +5446,10 @@ func (db *DB) GetSyncState(key string) (string, error) {
 }
 
 // SetSyncState writes a value to the pg_sync_state table.
-func (db *DB) SetSyncState(key, value string) error {
+func (db *DB) SetSyncState(ctx context.Context, key, value string) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	_, err := db.getWriter().Exec(
+	_, err := db.getWriter().Exec(ctx,
 		`INSERT INTO pg_sync_state (key, value)
 		 VALUES (?, ?)
 		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
@@ -5022,13 +5463,13 @@ func (db *DB) SetSyncState(key, value string) error {
 // designs (e.g. the pre-schema-v3 DuckDB push watermarks, now tracked in
 // the mirror's own sync_metadata table instead of local pg_sync_state).
 // prefix is escaped so LIKE metacharacters in it (%, _) match literally.
-func (db *DB) DeleteSyncStateByPrefix(prefix string) error {
+func (db *DB) DeleteSyncStateByPrefix(ctx context.Context, prefix string) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	escaped := strings.NewReplacer(
 		"\\", "\\\\", "%", "\\%", "_", "\\_",
 	).Replace(prefix)
-	_, err := db.getWriter().Exec(
+	_, err := db.getWriter().Exec(ctx,
 		"DELETE FROM pg_sync_state WHERE key LIKE ? ESCAPE '\\'",
 		escaped+"%",
 	)
@@ -5036,10 +5477,10 @@ func (db *DB) DeleteSyncStateByPrefix(prefix string) error {
 }
 
 // DeleteSyncState removes the pg_sync_state row for exactly key, if present.
-func (db *DB) DeleteSyncState(key string) error {
+func (db *DB) DeleteSyncState(ctx context.Context, key string) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	_, err := db.getWriter().Exec(
+	_, err := db.getWriter().Exec(ctx,
 		"DELETE FROM pg_sync_state WHERE key = ?", key,
 	)
 	return err
@@ -5047,12 +5488,12 @@ func (db *DB) DeleteSyncState(key string) error {
 
 // GetOrCreateSyncState returns a sync-state value, atomically creating it
 // with defaultValue when absent.
-func (db *DB) GetOrCreateSyncState(key, defaultValue string) (string, error) {
+func (db *DB) GetOrCreateSyncState(ctx context.Context, key, defaultValue string) (string, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	w := db.getWriter()
 	var value string
-	err := w.QueryRow(
+	err := w.QueryRow(ctx,
 		`INSERT INTO pg_sync_state (key, value)
 		 VALUES (?, ?)
 		 ON CONFLICT(key) DO NOTHING
@@ -5062,10 +5503,10 @@ func (db *DB) GetOrCreateSyncState(key, defaultValue string) (string, error) {
 	if err == nil {
 		return value, nil
 	}
-	if err != sql.ErrNoRows {
+	if !errors.Is(err, sql.ErrNoRows) {
 		return "", err
 	}
-	err = w.QueryRow(
+	err = w.QueryRow(ctx,
 		"SELECT value FROM pg_sync_state WHERE key = ?", key,
 	).Scan(&value)
 	return value, err

@@ -50,6 +50,54 @@ func TestSupplementalPricing_KimiK3StaticAliases(t *testing.T) {
 	assert.False(t, ok,
 		"gpt-reserve must not have a static row; it prices through %s",
 		GPT56LunaCanonical)
+	_, ok = byPattern[CodexAutoReviewModelName]
+	assert.False(t, ok,
+		"codex-auto-review must not have a static row; it prices through %s",
+		GPT56LunaCanonical)
+}
+
+// TestSupplementalPricing_StepFunStep5Preview pins the curated StepFun
+// row. The pinned LiteLLM snapshot has no stepfun entries at all, so a
+// step-5-preview session otherwise reports unpriced. Rates are
+// StepFun's published USD list prices, read 2026-09-21 from
+// <https://platform.stepfun.ai/docs/en/guides/pricing/details>. That
+// page notes the cache-miss input price includes writing new content
+// to the cache, so cache creation bills at the input rate.
+func TestSupplementalPricing_StepFunStep5Preview(t *testing.T) {
+	fallback := requireEmbeddedFallbackPricing(t)
+	byPattern := make(map[string]ModelPricing, len(fallback))
+	for _, p := range fallback {
+		byPattern[p.ModelPattern] = p
+	}
+
+	want := ModelPricing{
+		ModelPattern:         "step-5-preview",
+		InputPerMTok:         money.MustParseDollars("1.00"),
+		OutputPerMTok:        money.MustParseDollars("2.70"),
+		CacheCreationPerMTok: money.MustParseDollars("1.00"),
+		CacheReadPerMTok:     money.MustParseDollars("0.05"),
+	}
+	// The bare name and the provider-qualified spelling both resolve to
+	// the same curated row.
+	for _, model := range []string{"step-5-preview", "stepfun/step-5-preview"} {
+		got, ok := Resolve(byPattern, model)
+		require.True(t, ok, "Resolve(%q) found no pricing", model)
+		assertFlatPricing(t, want, got)
+	}
+
+	// An unrelated model keeps resolving to its own catalog row.
+	var unrelated ModelPricing
+	for _, p := range requireEmbeddedFallbackSnapshot(t).Models {
+		if p.ModelPattern == "claude-opus-4-6" {
+			unrelated = p
+			break
+		}
+	}
+	require.NotEmpty(t, unrelated.ModelPattern)
+	got, ok := Resolve(byPattern, unrelated.ModelPattern)
+	require.True(t, ok, "unrelated model %q should still resolve",
+		unrelated.ModelPattern)
+	assert.Equal(t, unrelated, got)
 }
 
 func TestDateAliasedModels(t *testing.T) {
@@ -96,6 +144,17 @@ func TestCanonicalModelForDate(t *testing.T) {
 		{"gpt-reserve maps to Luna after cutoff", GPTReserveModelName, post, GPT56LunaCanonical},
 		{"gpt-reserve ignores zero time", GPTReserveModelName, time.Time{}, GPT56LunaCanonical},
 		{"provider-prefixed gpt-reserve", "openai/" + GPTReserveModelName, post, GPT56LunaCanonical},
+		{"codex-auto-review maps to Luna", CodexAutoReviewModelName, post, GPT56LunaCanonical},
+		{"codex-auto-review ignores zero time", CodexAutoReviewModelName, time.Time{}, GPT56LunaCanonical},
+		{"provider-prefixed codex-auto-review", "openai/" + CodexAutoReviewModelName, post, GPT56LunaCanonical},
+		{"near-miss codex-auto-reviewer passes through", "codex-auto-reviewer", post, ""},
+		{"near-miss codex-auto-review-preview passes through", "codex-auto-review-preview", post, ""},
+		{"Codex GPT-5.4 maps to standard Bedrock model", CodexGPT54ModelName, post, BedrockGPT54Canonical},
+		{"Codex GPT-5.6 Luna maps to standard Bedrock model", CodexGPT56LunaModelName, post, BedrockGPT56LunaCanonical},
+		{"Codex GPT-5.6 Terra maps to standard Bedrock model", CodexGPT56TerraModelName, post, BedrockGPT56TerraCanonical},
+		{"Codex Astra maps to Bedrock model", "openai.gpt-6-astra", post, "bedrock_mantle/openai.gpt-6-astra"},
+		{"qualified Bedrock model passes through", "bedrock_mantle/openai.gpt-5.4", post, ""},
+		{"GovCloud model passes through", "bedrock_mantle/us-gov-west-1/openai.gpt-5.4", post, ""},
 		{"flat k3 alias is not date-ambiguous", "k3", pre, ""},
 		{"flat k3-agent alias is not date-ambiguous", "k3-agent", pre, ""},
 		{"canonical k2.6 model passes through", KimiK26Canonical, pre, ""},
@@ -126,6 +185,8 @@ func TestCanonicalModelForTimestamp(t *testing.T) {
 		{"garbage timestamp falls back to K3", "kimi-for-coding", "not-a-time", KimiK3Canonical},
 		{"explicit K2.6 alias ignores timestamp", "k2d6-agent", "not-a-time", KimiK26Canonical},
 		{"gpt-reserve ignores garbage timestamp", GPTReserveModelName, "not-a-time", GPT56LunaCanonical},
+		{"codex-auto-review ignores garbage timestamp", CodexAutoReviewModelName, "not-a-time", GPT56LunaCanonical},
+		{"Codex GPT-5.6 Luna ignores garbage timestamp", CodexGPT56LunaModelName, "not-a-time", BedrockGPT56LunaCanonical},
 		{"non-alias passes through", "k3", "2026-07-18T12:00:00Z", ""},
 	}
 	for _, tt := range tests {
@@ -154,20 +215,41 @@ func TestFallbackPricing_IncludesSupplementals(t *testing.T) {
 	}
 }
 
-// TestFallbackPricing_DateAliasTargetsResolvable proves both canonical
-// models the date-ambiguous aliases map onto exist in the fallback
-// set, so a mapped lookup always resolves: KimiK26Canonical from the
-// embedded snapshot, KimiK3Canonical from the supplemental rows.
-func TestFallbackPricing_DateAliasTargetsResolvable(t *testing.T) {
+// TestFallbackPricing_AliasTargetsResolvable proves every canonical model
+// runtime aliases map onto exists in the fallback set.
+func TestFallbackPricing_AliasTargetsResolvable(t *testing.T) {
 	byPattern := make(map[string]ModelPricing)
 	for _, p := range requireEmbeddedFallbackPricing(t) {
 		byPattern[p.ModelPattern] = p
 	}
-	for _, model := range []string{KimiK26Canonical, KimiK3Canonical, GPT56LunaCanonical} {
+	for _, model := range []string{
+		KimiK26Canonical,
+		KimiK3Canonical,
+		GPT56LunaCanonical,
+		BedrockGPT54Canonical,
+		BedrockGPT56LunaCanonical,
+		BedrockGPT56TerraCanonical,
+		GPT6AstraCanonical,
+	} {
 		_, ok := byPattern[model]
-		assert.True(t, ok,
-			"date-alias target %q missing from FallbackPricing", model)
+		require.True(t, ok,
+			"alias target %q missing from FallbackPricing", model)
 	}
+
+	astra := byPattern[GPT6AstraCanonical]
+	assert.Equal(t, money.MustParseDollars("11"), astra.InputPerMTok)
+	assert.Equal(t, money.MustParseDollars("55"), astra.OutputPerMTok)
+	assert.Equal(t, money.MustParseDollars("13.75"),
+		astra.CacheCreationPerMTok)
+	assert.Equal(t, money.MustParseDollars("1.1"), astra.CacheReadPerMTok)
+	require.Len(t, astra.Bands, 1)
+	assert.Equal(t, PricingBand{
+		AboveInputTokens:     272_000,
+		InputPerMTok:         money.MustParseDollars("22"),
+		OutputPerMTok:        money.MustParseDollars("82.5"),
+		CacheCreationPerMTok: money.MustParseDollars("27.5"),
+		CacheReadPerMTok:     money.MustParseDollars("2.2"),
+	}, astra.Bands[0])
 }
 
 // TestFallbackPricing_SupplementalsDoNotCollideWithSnapshot guards
@@ -195,8 +277,7 @@ func TestFallbackPricing_SupplementalsDoNotCollideWithSnapshot(t *testing.T) {
 func TestSeedVersion_FoldsInSupplementalVersion(t *testing.T) {
 	snapshot := requireEmbeddedFallbackSnapshot(t)
 	assert.Equal(t, snapshot.Version, FallbackVersion)
-	assert.True(t,
-		strings.HasPrefix(SeedVersion, FallbackVersion+"+supplemental-"),
+	assert.True(t, strings.HasPrefix(SeedVersion, FallbackVersion+"+supplemental-"),
 		"SeedVersion %q must be FallbackVersion plus a supplemental suffix",
 		SeedVersion)
 	assert.NotEqual(t, FallbackVersion, SeedVersion,
@@ -214,8 +295,8 @@ func TestFixedPricingAliasesReturnsCopy(t *testing.T) {
 func TestSupplementalPricing_ReturnsCopy(t *testing.T) {
 	first := SupplementalPricing()
 	require.NotEmpty(t, first)
+	original := first[0].InputPerMTok
 	first[0].InputPerMTok = money.Money{Microdollars: -1}
-	assert.NotEqual(t, money.Money{Microdollars: -1},
-		SupplementalPricing()[0].InputPerMTok,
+	assert.Equal(t, original, SupplementalPricing()[0].InputPerMTok,
 		"SupplementalPricing must return an independent copy")
 }

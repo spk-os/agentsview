@@ -33,8 +33,11 @@ func TestLoadFileAgentHomesAreAdditiveToDefaults(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	t.Setenv("CODEX_HOME", "")
 	f.WriteConfigText(t, `
-claude_homes = ["/homes/work/.claude"]
-codex_homes = ["/homes/work/.codex", "/homes/other/.codex-alt"]
+[agents.claude]
+homes = ["/homes/work/.claude"]
+
+[agents.codex]
+homes = ["/homes/work/.codex", "/homes/other/.codex-alt"]
 `)
 
 	cfg := f.LoadMinimal(t)
@@ -53,7 +56,7 @@ codex_homes = ["/homes/work/.codex", "/homes/other/.codex-alt"]
 	}, cfg.ResolveDirs(parser.AgentCodex))
 	assert.True(t, cfg.IsUserConfigured(parser.AgentClaude))
 	assert.True(t, cfg.IsUserConfigured(parser.AgentCodex))
-	assert.Equal(t, cfg.LocalMachineName,
+	assert.Equal(t, cfg.InstallationID,
 		cfg.SourceMachines[parser.AgentCodex][filepath.Join(absoluteTestPath(t, "/homes/work/.codex"), "sessions")])
 }
 
@@ -64,13 +67,14 @@ func TestLoadFileAgentHomesExpandTildeAndDeduplicate(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	t.Setenv("CODEX_HOME", "")
 	f.WriteConfigText(t, `
-codex_sessions_dirs = ["/explicit/sessions"]
-codex_homes = ["~/.codex", "/explicit", "/explicit/./"]
-
 [[session_sources]]
 agent = "codex"
 dir = "/explicit/archived_sessions"
 machine = "buildbox"
+
+[agents.codex]
+dirs = ["/explicit/sessions"]
+homes = ["~/.codex", "/explicit", "/explicit/./"]
 `)
 
 	cfg := f.LoadMinimal(t)
@@ -90,8 +94,9 @@ func TestLoadFileAgentHomesWithClearedDefaults(t *testing.T) {
 	setTestHome(t, canonicalTempDir(t))
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	f.WriteConfigText(t, `
-claude_project_dirs = []
-claude_homes = ["/homes/only"]
+[agents.claude]
+dirs = []
+homes = ["/homes/only"]
 `)
 
 	cfg := f.LoadMinimal(t)
@@ -105,7 +110,8 @@ func TestLoadFileAgentHomesRemainAdditiveToEnvDirs(t *testing.T) {
 	setTestHome(t, canonicalTempDir(t))
 	t.Setenv("CODEX_SESSIONS_DIR", absoluteTestPath(t, "/env/codex"))
 	f.WriteConfigText(t, `
-codex_homes = ["/homes/work/.codex"]
+[agents.codex]
+homes = ["/homes/work/.codex"]
 `)
 
 	cfg := f.LoadMinimal(t)
@@ -124,9 +130,12 @@ func TestLoadFileAgentHomesValidation(t *testing.T) {
 		wantErr string
 	}{
 		{
-			name:    "s3 home",
-			config:  `codex_homes = ["/ok", "s3://bucket/codex"]`,
-			wantErr: "codex_homes: entry 2: home \"s3://bucket/codex\" is an S3 root",
+			name: "s3 home",
+			config: `
+[agents.codex]
+homes = ["/ok", "s3://bucket/codex"]
+`,
+			wantErr: "agents.codex.homes: entry 2: home \"s3://bucket/codex\" is an S3 root",
 		},
 	}
 	for _, tt := range tests {
@@ -171,7 +180,7 @@ func TestLoadFileAgentHomesDeduplicateSymlinkedRoots(t *testing.T) {
 	require.NoError(t, os.MkdirAll(alt, 0o755))
 	require.NoError(t, os.Symlink(
 		filepath.Join(primary, "sessions"), filepath.Join(alt, "sessions")))
-	f.WriteConfigText(t, "codex_homes = [\"~/.codex-alt\"]\n")
+	f.WriteConfigText(t, "[agents.codex]\nhomes = [\"~/.codex-alt\"]\n")
 
 	cfg := f.LoadMinimal(t)
 
@@ -223,6 +232,8 @@ func TestSaveSettingsPersistsAgentHomes(t *testing.T) {
 		reloaded.ConfiguredAgentHomes(parser.AgentClaude))
 }
 
+const aliasedProviderKey = " CODEX "
+
 func TestNormalizeAgentHomesRejectsUnsupportedInput(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -242,7 +253,7 @@ func TestNormalizeAgentHomesRejectsUnsupportedInput(t *testing.T) {
 		{
 			name:    "empty home",
 			input:   map[string][]string{"codex": {"/x", " "}},
-			wantErr: "codex_homes: entry 2: home is required",
+			wantErr: "agents.codex.homes: entry 2: home is required",
 		},
 		{
 			name:    "s3 home",
@@ -251,7 +262,7 @@ func TestNormalizeAgentHomesRejectsUnsupportedInput(t *testing.T) {
 		},
 		{
 			name:    "aliased provider keys",
-			input:   map[string][]string{"codex": {"/a"}, " CODEX ": {"/b"}},
+			input:   map[string][]string{"codex": {"/a"}, aliasedProviderKey: {"/b"}},
 			wantErr: `session provider "codex" is listed more than once`,
 		},
 	}
@@ -268,7 +279,10 @@ func TestLoadFileAgentHomesDropRepeatedSpellings(t *testing.T) {
 	f := newConfigFixture(t)
 	setTestHome(t, canonicalTempDir(t))
 	t.Setenv("CODEX_HOME", "")
-	f.WriteConfigText(t, `codex_homes = ["/homes/a", " /homes/a ", "", "/homes/b"]`)
+	f.WriteConfigText(t, `
+[agents.codex]
+homes = ["/homes/a", " /homes/a ", "", "/homes/b"]
+`)
 
 	cfg := f.LoadMinimal(t)
 
@@ -289,7 +303,7 @@ func TestRuntimeRootsResolveBeforeDeduplication(t *testing.T) {
 				}
 			}
 			cfg := Config{
-				LocalMachineName: "host-a",
+				InstallationID: "host-a",
 				AgentDirs: map[parser.AgentType][]string{
 					parser.AgentCodex: {"profile/sessions", "primary/sessions"},
 				},

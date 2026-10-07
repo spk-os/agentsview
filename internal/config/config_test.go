@@ -2,12 +2,12 @@ package config
 
 import (
 	"bytes"
-	"context"
 	"flag"
 	"log"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -22,6 +22,32 @@ import (
 )
 
 const configFileName = "config.toml"
+
+func TestCodeBuddyDefaultAndOverride(t *testing.T) {
+	home := canonicalTempDir(t)
+	setTestHome(t, home)
+	for _, appData := range []string{"", "relative", canonicalTempDir(t)} {
+		t.Run(appData, func(t *testing.T) {
+			t.Setenv("LOCALAPPDATA", appData)
+			t.Setenv("CODEBUDDY_DIR", "")
+			cfg, err := Default()
+			require.NoError(t, err)
+			dirs := cfg.ResolveDirs(parser.AgentCodeBuddy)
+			require.Len(t, dirs, 3)
+			expected := filepath.Join(home, "AppData", "Local", "CodeBuddyExtension", "Data")
+			if runtime.GOOS == "windows" && filepath.IsAbs(appData) {
+				expected = filepath.Join(appData, "CodeBuddyExtension", "Data")
+			}
+			assert.Equal(t, expected, dirs[0])
+			assert.Equal(t, filepath.Join(home, "Library", "Application Support", "CodeBuddyExtension", "Data"), dirs[1])
+			assert.Equal(t, filepath.Join(home, ".config", "CodeBuddyExtension", "Data"), dirs[2])
+			custom := canonicalTempDir(t)
+			t.Setenv("CODEBUDDY_DIR", custom)
+			cfg.loadEnv()
+			assert.Equal(t, []string{custom}, cfg.ResolveDirs(parser.AgentCodeBuddy))
+		})
+	}
+}
 
 func skipIfNotUnix(t *testing.T) {
 	t.Helper()
@@ -113,6 +139,84 @@ func TestChartPaletteRejectsInvalidValue(t *testing.T) {
 			require.EqualError(t, err, tt.want)
 		})
 	}
+}
+
+func TestZoomLevelConfig(t *testing.T) {
+	for _, level := range []int{67, 75, 80, 90, 100, 110, 120, 125, 130, 150, 175, 200} {
+		t.Run(strconv.Itoa(level), func(t *testing.T) {
+			cfg, err := Default()
+			require.NoError(t, err)
+			require.NoError(t, cfg.applyConfigTOML("zoom_level = "+strconv.Itoa(level)))
+			require.NotNil(t, cfg.ZoomLevel)
+			assert.Equal(t, ZoomLevel(level), *cfg.ZoomLevel)
+		})
+	}
+
+	cfg, err := Default()
+	require.NoError(t, err)
+	assert.Nil(t, cfg.ZoomLevel)
+	require.NoError(t, cfg.applyConfigTOML("zoom_level = 100"))
+	require.NotNil(t, cfg.ZoomLevel)
+	assert.Equal(t, ZoomLevel100, *cfg.ZoomLevel)
+}
+
+func TestZoomLevelConfigRejectsInvalidValuesWithoutMutation(t *testing.T) {
+	for _, toml := range []string{
+		"zoom_level = 0",
+		"zoom_level = 101",
+		"zoom_level = -1",
+		"zoom_level = 100.5",
+		`zoom_level = "120"`,
+		"zoom_level = true",
+	} {
+		t.Run(strings.ReplaceAll(toml, " ", "_"), func(t *testing.T) {
+			cfg, err := Default()
+			require.NoError(t, err)
+			zoom := ZoomLevel120
+			cfg.ZoomLevel = &zoom
+			err = cfg.applyConfigTOML(toml)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "zoom_level")
+			require.NotNil(t, cfg.ZoomLevel)
+			assert.Equal(t, ZoomLevel120, *cfg.ZoomLevel)
+		})
+	}
+}
+
+func TestToolResultImagesConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		toml string
+		want ToolResultImages
+	}{
+		{name: "missing defaults to keep", want: ToolResultImagesKeep},
+		{name: "keep trims and folds", toml: `tool_result_images = " KEEP "`, want: ToolResultImagesKeep},
+		{name: "offload", toml: `tool_result_images = "offload"`, want: ToolResultImagesOffload},
+		{name: "drop trims and folds", toml: `tool_result_images = " Drop "`, want: ToolResultImagesDrop},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := Default()
+			require.NoError(t, err)
+			require.NoError(t, cfg.applyConfigTOML(tt.toml))
+			assert.Equal(t, tt.want, cfg.ToolResultImages)
+		})
+	}
+
+	cfg, err := Default()
+	require.NoError(t, err)
+	require.EqualError(t, cfg.applyConfigTOML(`tool_result_images = "discard"`),
+		`tool_result_images must be "keep", "drop", or "offload" (got "discard")`)
+
+	dir := setupTestEnv(t)
+	cfg.DataDir = dir
+	require.NoError(t, cfg.SaveSettings(map[string]any{
+		"tool_result_images": ToolResultImagesOffload,
+	}))
+	assert.Equal(t, ToolResultImagesOffload, cfg.ToolResultImages)
+	loaded, err := LoadMinimal()
+	require.NoError(t, err)
+	assert.Equal(t, ToolResultImagesOffload, loaded.ToolResultImages)
 }
 
 func setTestHome(t *testing.T, home string) {
@@ -406,6 +510,7 @@ func TestDefault_IncludesHermesProfilesRoot(t *testing.T) {
 
 	assert.Contains(t, dirs, filepath.Join(home, ".hermes", "sessions"))
 	assert.Contains(t, dirs, filepath.Join(home, ".hermes", "profiles"))
+	assert.Contains(t, dirs, filepath.Join(home, "AppData", "Local", "hermes", "sessions"))
 }
 
 func TestDefault_HermesNoProfilesDirIsSafe(t *testing.T) {
@@ -432,6 +537,18 @@ func TestDefault_HermesEnvReplacesDefaultAndProfilesRoots(t *testing.T) {
 	assert.Equal(t, []string{custom}, cfg.ResolveDirs(parser.AgentHermes))
 }
 
+func TestLoad_HermesConfigDirsReplaceAllDefaultRoots(t *testing.T) {
+	t.Setenv("HERMES_SESSIONS_DIR", "")
+	custom := filepath.Join(canonicalTempDir(t), "hermes-sessions")
+
+	cfg := loadMinimalWithConfig(t, map[string]any{
+		"hermes_sessions_dirs": []string{custom},
+	})
+
+	assert.Equal(t, []string{custom}, cfg.ResolveDirs(parser.AgentHermes))
+	assert.True(t, cfg.IsUserConfigured(parser.AgentHermes))
+}
+
 func TestLoadEnv_GoosePathRootUsesProducerLayout(t *testing.T) {
 	for _, basename := range []string{"data", "sessions"} {
 		t.Run(basename, func(t *testing.T) {
@@ -447,7 +564,7 @@ func TestLoadEnv_GoosePathRootUsesProducerLayout(t *testing.T) {
 			})
 			require.True(t, ok)
 
-			plan, err := provider.WatchPlan(context.Background())
+			plan, err := provider.WatchPlan(t.Context())
 			require.NoError(t, err)
 			require.Len(t, plan.Roots, 1)
 			assert.Equal(t,
@@ -553,6 +670,73 @@ func TestLoadPFlags_AppliesExplicitFlags(t *testing.T) {
 
 	assert.Equal(t, "0.0.0.0", cfg.Host)
 	assert.Equal(t, 9090, cfg.Port)
+}
+
+func TestPortExplicitProvenance(t *testing.T) {
+	t.Run("standard flag marks explicit default", func(t *testing.T) {
+		cfg, err := loadConfigFromFlags(t, "-port", "8080")
+		require.NoError(t, err)
+		assert.Equal(t, 8080, cfg.Port)
+		assert.True(t, cfg.PortExplicit)
+	})
+
+	t.Run("pflag marks explicit default", func(t *testing.T) {
+		cfg, err := loadConfigFromPFlags(t, "--port", "8080")
+		require.NoError(t, err)
+		assert.Equal(t, 8080, cfg.Port)
+		assert.True(t, cfg.PortExplicit)
+	})
+
+	t.Run("explicit zero remains explicit", func(t *testing.T) {
+		cfg, err := loadConfigFromPFlags(t, "--port", "0")
+		require.NoError(t, err)
+		assert.Zero(t, cfg.Port)
+		assert.True(t, cfg.PortExplicit)
+	})
+
+	t.Run("omitted port stays implicit", func(t *testing.T) {
+		standard, err := loadConfigFromFlags(t)
+		require.NoError(t, err)
+		pflagConfig, err := loadConfigFromPFlags(t)
+		require.NoError(t, err)
+		assert.Equal(t, 8080, standard.Port)
+		assert.False(t, standard.PortExplicit)
+		assert.Equal(t, 8080, pflagConfig.Port)
+		assert.False(t, pflagConfig.PortExplicit)
+	})
+
+	t.Run("persisted port stays implicit", func(t *testing.T) {
+		dir := setupTestEnv(t)
+		writeConfig(t, dir, map[string]any{"port": 7357})
+		fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
+		RegisterServePFlags(fs)
+		cfg, err := LoadPFlags(fs)
+		require.NoError(t, err)
+		assert.Equal(t, 7357, cfg.Port)
+		assert.False(t, cfg.PortExplicit)
+	})
+
+	t.Run("pg and duckdb loaders mark explicit ports", func(t *testing.T) {
+		for _, load := range []struct {
+			name string
+			fn   func(*pflag.FlagSet) (Config, error)
+		}{
+			{name: "pg", fn: LoadRemoteServePFlags},
+			{name: "duckdb", fn: LoadRemoteServePFlags},
+			{name: "clickhouse", fn: LoadRemoteServePFlags},
+		} {
+			t.Run(load.name, func(t *testing.T) {
+				setupTestEnv(t)
+				fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
+				RegisterServePFlags(fs)
+				require.NoError(t, fs.Parse([]string{"--port", "8080"}))
+				cfg, err := load.fn(fs)
+				require.NoError(t, err)
+				assert.Equal(t, 8080, cfg.Port)
+				assert.True(t, cfg.PortExplicit)
+			})
+		}
+	})
 }
 
 func TestLoad_NilFlagSet(t *testing.T) {
@@ -908,6 +1092,13 @@ func TestAgentDirsExplicitEmptyArrayOverridesDefaults(t *testing.T) {
 	assert.True(t, cfg.IsUserConfigured(parser.AgentCopilot))
 }
 
+func TestDefaultWatchExcludesTransientLockFiles(t *testing.T) {
+	cfg, err := Default()
+	require.NoError(t, err)
+
+	assert.Contains(t, cfg.WatchExcludePatterns, "*.lock*")
+}
+
 func TestAgentDirsEnvBeatsExplicitEmptyArray(t *testing.T) {
 	f := newConfigFixture(t)
 	f.WriteConfigText(t, "grok_dirs = []\n")
@@ -1029,7 +1220,7 @@ machine = "archivebox"
 		absoluteTestPath(t, "/sessions/duplicate"),
 		absoluteTestPath(t, "/sessions/archive"),
 	}, cfg.ResolveDirs(parser.AgentCopilot))
-	assert.Equal(t, cfg.LocalMachineName,
+	assert.Equal(t, cfg.InstallationID,
 		cfg.SourceMachines[parser.AgentCopilot][absoluteTestPath(t, "/sessions/local")])
 	assert.Equal(t, "archivebox",
 		cfg.SourceMachines[parser.AgentCopilot][absoluteTestPath(t, "/sessions/duplicate")])
@@ -1074,7 +1265,7 @@ machine = "archivebox"
 		absoluteTestPath(t, "/sessions/from-env"),
 		absoluteTestPath(t, "/sessions/from-archive"),
 	}, cfg.ResolveDirs(parser.AgentCopilot))
-	assert.Equal(t, cfg.LocalMachineName,
+	assert.Equal(t, cfg.InstallationID,
 		cfg.SourceMachines[parser.AgentCopilot][absoluteTestPath(t, "/sessions/from-env")])
 	assert.Equal(t, "archivebox",
 		cfg.SourceMachines[parser.AgentCopilot][absoluteTestPath(t, "/sessions/from-archive")])
@@ -1091,7 +1282,7 @@ func TestLoadFileSessionSourcesPreserveLegacyS3Roots(t *testing.T) {
 		"s3://session-archive/claude")
 }
 
-func TestLoadFileSessionSourceDefaultsMachineToHostname(t *testing.T) {
+func TestLoadFileSessionSourceDefaultsMachineToInstallationID(t *testing.T) {
 	cfg := loadMinimalWithConfig(t, map[string]any{
 		"session_sources": []map[string]any{{
 			"agent": "copilot",
@@ -1100,10 +1291,10 @@ func TestLoadFileSessionSourceDefaultsMachineToHostname(t *testing.T) {
 	})
 
 	require.NotEmpty(t, cfg.LocalMachineName)
-	assert.Equal(t, cfg.LocalMachineName,
+	assert.Equal(t, cfg.InstallationID,
 		cfg.SourceMachines[parser.AgentCopilot][absoluteTestPath(t, "/sessions/archive")])
 	require.Len(t, cfg.SessionSources, 1)
-	assert.Equal(t, cfg.LocalMachineName, cfg.SessionSources[0].Machine)
+	assert.Equal(t, cfg.InstallationID, cfg.SessionSources[0].Machine)
 }
 
 func TestLoadFileSessionSourceValidation(t *testing.T) {
@@ -1364,6 +1555,33 @@ func TestResolveDirs_DeepSeekHarnessPrecedence(t *testing.T) {
 	})
 }
 
+func TestResolveDirs_JunieHomeAndExplicitOverride(t *testing.T) {
+	t.Run("JUNIE_HOME re-roots implicit sessions directory", func(t *testing.T) {
+		dir := setupTestEnv(t)
+		root := canonicalTempDir(t)
+		t.Setenv("JUNIE_HOME", root)
+		writeConfig(t, dir, map[string]any{})
+
+		cfg, err := LoadMinimal()
+		require.NoError(t, err)
+		assert.Equal(t, []string{filepath.Join(root, "sessions")}, cfg.ResolveDirs(parser.AgentJunie))
+		assert.False(t, cfg.IsUserConfigured(parser.AgentJunie))
+	})
+
+	t.Run("JUNIE_DIR beats JUNIE_HOME", func(t *testing.T) {
+		dir := setupTestEnv(t)
+		t.Setenv("JUNIE_HOME", canonicalTempDir(t))
+		explicit := absoluteTestPath(t, "/from/env/junie-sessions")
+		t.Setenv("JUNIE_DIR", explicit)
+		writeConfig(t, dir, map[string]any{})
+
+		cfg, err := LoadMinimal()
+		require.NoError(t, err)
+		assert.Equal(t, []string{explicit}, cfg.ResolveDirs(parser.AgentJunie))
+		assert.True(t, cfg.IsUserConfigured(parser.AgentJunie))
+	})
+}
+
 func TestResolveDirs_DevinPrecedenceAndMergeRules(t *testing.T) {
 	t.Run("config overrides defaults", func(t *testing.T) {
 		cfg := loadMinimalWithConfig(t, map[string]any{
@@ -1416,6 +1634,70 @@ func TestResolveDataDir_DefaultAndEnvOverride(t *testing.T) {
 	dir, err = ResolveDataDir()
 	require.NoError(t, err)
 	assert.Equal(t, custom, dir)
+}
+
+func TestArchiveContentDefaultsAndLoads(t *testing.T) {
+	tests := []struct {
+		name string
+		toml string
+		want ArchiveContent
+	}{
+		{name: "omitted", want: ArchiveContentFull},
+		{name: "full", toml: `archive_content = "full"`, want: ArchiveContentFull},
+		{
+			name: "transcripts",
+			toml: `archive_content = "transcripts"`,
+			want: ArchiveContentTranscripts,
+		},
+		{name: "usage", toml: `archive_content = "usage"`, want: ArchiveContentUsage},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := Default()
+			require.NoError(t, err)
+			require.NoError(t, cfg.applyConfigTOML(tt.toml))
+			assert.Equal(t, tt.want, cfg.ArchiveContent)
+		})
+	}
+}
+
+func TestArchiveContentRejectsInvalidValue(t *testing.T) {
+	cfg, err := Default()
+	require.NoError(t, err)
+	err = cfg.applyConfigTOML(`archive_content = "metadata"`)
+	require.EqualError(t, err,
+		`archive_content must be "full", "transcripts", or "usage" (got "metadata")`)
+}
+
+func TestArchiveContentFromEnvironment(t *testing.T) {
+	tests := []struct {
+		name string
+		env  string
+		want ArchiveContent
+	}{
+		{name: "valid", env: "transcripts", want: ArchiveContentTranscripts},
+		{name: "invalid keeps default", env: "everything", want: ArchiveContentFull},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newConfigFixture(t)
+			t.Setenv("AGENTSVIEW_ARCHIVE_CONTENT", tt.env)
+
+			cfg := f.LoadMinimal(t)
+
+			assert.Equal(t, tt.want, cfg.ArchiveContent)
+		})
+	}
+}
+
+func TestArchiveContentFileWinsOverEnvironment(t *testing.T) {
+	f := newConfigFixture(t)
+	f.WriteConfigText(t, `archive_content = "usage"`+"\n")
+	t.Setenv("AGENTSVIEW_ARCHIVE_CONTENT", "transcripts")
+
+	cfg := f.LoadMinimal(t)
+
+	assert.Equal(t, ArchiveContentUsage, cfg.ArchiveContent)
 }
 
 func TestResolveDataDir_ExpandsHome(t *testing.T) {
@@ -1480,7 +1762,7 @@ func TestLoadFile_MalformedDirValueLogsWarning(t *testing.T) {
 	cfg := f.LoadMinimal(t)
 
 	// The malformed key should trigger a warning.
-	assertLogContains(t, buf, "claude_project_dirs", "expected string array")
+	assertLogContains(t, buf, "agents.claude.dirs", "expected string array")
 
 	// ResolveDirs should return the default (malformed value
 	// was not applied).
@@ -1889,6 +2171,7 @@ require_auth = true
 
 func TestResolvePG_Defaults(t *testing.T) {
 	cfg := Config{
+		InstallationID: "installation-a",
 		PG: PGConfig{
 			URL: "postgres://localhost/test",
 		},
@@ -1897,7 +2180,7 @@ func TestResolvePG_Defaults(t *testing.T) {
 	require.NoError(t, err, "ResolvePG")
 
 	assert.Equal(t, "agentsview", resolved.Schema)
-	assert.NotEmpty(t, resolved.MachineName, "MachineName should default to hostname")
+	assert.Equal(t, "installation-a", resolved.MachineName)
 }
 
 func TestLoadResolvesLocalMachineNameFromHostname(t *testing.T) {
@@ -1908,6 +2191,89 @@ func TestLoadResolvesLocalMachineNameFromHostname(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, hostname, cfg.LocalMachineName)
+}
+
+func TestInstallationIDSurvivesHostnameChanges(t *testing.T) {
+	dir := setupTestEnv(t)
+	const id = "0123456789abcdef0123456789abcdef"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "telemetry-install-id"), []byte(id), 0o600))
+	for _, hostname := range []string{"local", "host-a.local", "host-a.example", "host-b.example"} {
+		cfg, err := Default()
+		require.NoError(t, err)
+		cfg.DataDir = dir
+		cfg.LocalMachineName = hostname
+		localDir := filepath.Join(dir, "claude")
+		cfg.AgentDirs = map[parser.AgentType][]string{parser.AgentClaude: {localDir}}
+		cfg.sessionSourceConfigs = []sessionSourceConfig{
+			{Agent: "copilot", Dir: filepath.Join(dir, "copilot")},
+			{Agent: "codex", Dir: filepath.Join(dir, "codex"), Machine: new("host-c.example")},
+		}
+		// Each fresh config represents a process starting on a different network.
+		require.NoError(t, finishLoadedConfig(&cfg))
+		assert.Equal(t, hostname, cfg.LocalMachineName)
+		assert.Equal(t, id, cfg.SourceMachines[parser.AgentClaude][localDir])
+		require.Len(t, cfg.SessionSources, 2)
+		assert.Equal(t, id, cfg.SessionSources[0].Machine)
+		assert.Equal(t, "host-c.example", cfg.SessionSources[1].Machine)
+		cfg.PG.URL = "postgres://localhost/test"
+		pg, err := cfg.ResolvePG()
+		require.NoError(t, err)
+		assert.Equal(t, id, pg.MachineName)
+		duck, err := cfg.ResolveDuckDB()
+		require.NoError(t, err)
+		assert.Equal(t, id, duck.MachineName)
+	}
+	before, err := os.ReadFile(filepath.Join(dir, configFileName))
+	require.NoError(t, err)
+	cfg, err := LoadReadOnly()
+	require.NoError(t, err)
+	assert.Equal(t, id, cfg.InstallationID)
+	after, err := os.ReadFile(filepath.Join(dir, configFileName))
+	require.NoError(t, err)
+	assert.Equal(t, before, after)
+}
+
+func TestLoadConfiguredLocalMachineName(t *testing.T) {
+	dir := setupTestEnv(t)
+	writeConfig(t, dir, map[string]any{
+		"local_machine_name": "host-a.example",
+		"cursor_secret":      "existing-secret",
+	})
+	cfg, err := LoadMinimal()
+	require.NoError(t, err)
+	assert.Equal(t, "host-a.example", cfg.LocalMachineName)
+	assert.Equal(t, "existing-secret", cfg.CursorSecret)
+}
+
+func TestLoadRejectsInvalidLocalMachineName(t *testing.T) {
+	for _, name := range []string{"", "  "} {
+		t.Run(name, func(t *testing.T) {
+			dir := setupTestEnv(t)
+			writeConfig(t, dir, map[string]any{"local_machine_name": name})
+			_, err := LoadMinimal()
+			require.ErrorContains(t, err, "local_machine_name")
+		})
+	}
+}
+
+func TestSavedMachineNamePreservesSymlinkedCodexMetadata(t *testing.T) {
+	skipIfNotUnix(t)
+	dir := setupTestEnv(t)
+	writeConfig(t, dir, map[string]any{"local_machine_name": "host-a.example"})
+	root := filepath.Join(dir, "archive", "sessions")
+	home := filepath.Join(dir, "profile")
+	require.NoError(t, os.MkdirAll(root, 0o700))
+	require.NoError(t, os.MkdirAll(home, 0o700))
+	alias := filepath.Join(home, "sessions")
+	require.NoError(t, os.Symlink(root, alias))
+	cfg, err := Default()
+	require.NoError(t, err)
+	cfg.DataDir = dir
+	cfg.LocalMachineName = "host-b.example"
+	cfg.AgentDirs = map[parser.AgentType][]string{parser.AgentCodex: {alias}}
+	require.NoError(t, finishLoadedConfig(&cfg))
+	assert.Equal(t, cfg.InstallationID, cfg.SourceMachines[parser.AgentCodex][root])
+	assert.Contains(t, cfg.ProviderMetadata[parser.AgentCodex][root], home)
 }
 
 func TestResolvePG_ExpandsEnvVars(t *testing.T) {
@@ -2050,13 +2416,13 @@ func TestDuckDBConfig_LoadsFileAndEnv(t *testing.T) {
 
 func TestResolveDuckDB_Defaults(t *testing.T) {
 	dir := canonicalTempDir(t)
-	cfg := Config{DataDir: dir}
+	cfg := Config{DataDir: dir, InstallationID: "installation-a"}
 
 	resolved, err := cfg.ResolveDuckDB()
 	require.NoError(t, err, "ResolveDuckDB")
 
 	assert.Equal(t, filepath.Join(dir, "sessions.duckdb"), resolved.Path)
-	assert.NotEmpty(t, resolved.MachineName, "MachineName should default to hostname")
+	assert.Equal(t, "installation-a", resolved.MachineName)
 }
 
 func TestResolveDuckDB_ExpandsEnvVars(t *testing.T) {
@@ -2192,7 +2558,7 @@ func TestLoadFile_CustomModelPricing(t *testing.T) {
 			for model, wantRate := range tt.want {
 				got, ok := cfg.CustomModelPricing[model]
 				if !ok {
-					t.Errorf("missing model %q", model)
+					assert.Failf(t, "test failed", "missing model %q", model)
 					continue
 				}
 				assert.Equal(t, wantRate, got, "model %q", model)
@@ -2258,22 +2624,25 @@ func TestLoadFile_RemoteHosts(t *testing.T) {
 	f := newConfigFixture(t)
 	f.WriteConfigText(t, `[[remote_hosts]]
 host = "devbox1"
-user = "jesse"
-port = 22
+url = "https://devbox1.example.test"
+token = "remote-token"
 interval = "5m"
 
 [[remote_hosts]]
 host = "  laptop2  "
+url = " https://laptop2.example.test "
+token = " remote-token "
 `)
 
 	cfg := f.LoadMinimal(t)
 
 	require.Len(t, cfg.RemoteHosts, 2)
-	assert.Equal(t, RemoteHost{Host: "devbox1", User: "jesse", Port: 22, Interval: 5 * time.Minute}, cfg.RemoteHosts[0])
+	assert.Equal(t, RemoteHost{Host: "devbox1", URL: "https://devbox1.example.test", Token: "remote-token", Interval: 5 * time.Minute}, cfg.RemoteHosts[0])
 	assert.Equal(t, 5*time.Minute, cfg.RemoteHosts[0].Interval)
 	assert.Equal(t, time.Duration(0), cfg.RemoteHosts[1].Interval)
-	// host is trimmed at load so validation and SSH see the same value
-	assert.Equal(t, RemoteHost{Host: "laptop2"}, cfg.RemoteHosts[1])
+	// Remote values are trimmed before validation and sync.
+	assert.Equal(t, RemoteHost{Host: "laptop2", URL: "https://laptop2.example.test", Token: "remote-token"}, cfg.RemoteHosts[1])
+	require.NoError(t, cfg.ValidateRemoteHosts())
 }
 
 func TestLoadFile_RemoteHostsHTTP(t *testing.T) {
@@ -2320,28 +2689,23 @@ func TestLoadFile_RemoteHostsAbsentIsNil(t *testing.T) {
 }
 
 func TestValidateRemoteHosts(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name    string
 		hosts   []RemoteHost
 		wantErr []string // substrings expected in error; empty => no error
 	}{
-		{"valid", []RemoteHost{{Host: "a"}, {Host: "b", Port: 22}, {Host: "c", Port: 0}}, nil},
+		{"omitted transport uses http", []RemoteHost{{Host: "a", URL: "https://a.example.test", Token: "token"}}, nil},
+		{"omitted transport requires credentials", []RemoteHost{{Host: "a"}}, []string{"url is required", "token is required"}},
 		{"empty host", []RemoteHost{{Host: ""}}, []string{"host is required"}},
-		{"negative port", []RemoteHost{{Host: "a", Port: -1}}, []string{"invalid port"}},
-		{"port too large", []RemoteHost{{Host: "a", Port: 70000}}, []string{"invalid port"}},
-		{"aggregates both", []RemoteHost{{Host: ""}, {Host: "b", Port: 99999}}, []string{"host is required", "invalid port"}},
+		{"aggregates entries", []RemoteHost{{Host: ""}, {Host: "b", Interval: -1}}, []string{"entry 1: host is required", "entry 2 (\"b\"): invalid interval"}},
 		{"duplicate host", []RemoteHost{{Host: "a"}, {Host: "a"}}, []string{"duplicate host"}},
-		{"duplicate host different user or port", []RemoteHost{{Host: "box", User: "alice"}, {Host: "box", User: "bob", Port: 2222}}, []string{"duplicate host"}},
-		{"option shaped host", []RemoteHost{{Host: "-oProxyCommand=sh"}}, []string{"host must not begin with '-'"}},
-		{"option shaped user", []RemoteHost{{Host: "box", User: "-lroot"}}, []string{"user must not begin with '-'"}},
 		{"none configured", nil, nil},
 		{"negative interval", []RemoteHost{{Host: "a", Interval: -1}}, []string{"invalid interval"}},
-		{"zero interval ok", []RemoteHost{{Host: "a", Interval: 0}}, nil},
+		{"zero interval ok", []RemoteHost{{Host: "a", URL: "https://a.example.test", Token: "token", Interval: 0}}, nil},
 		{"http valid", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "https://a.example.test", Token: "token"}}, nil},
 		{"http requires url", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP}}, []string{"url is required"}},
 		{"http requires token", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "https://a.example.test"}}, []string{"token is required"}},
-		{"http rejects user", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "https://a.example.test", User: "alice"}}, []string{"user is only valid for ssh"}},
-		{"http rejects port", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "https://a.example.test", Port: 443}}, []string{"port is only valid for ssh"}},
 		{"http rejects bad scheme", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "ftp://a.example.test"}}, []string{"url must use http or https"}},
 		{"http rejects empty hostname with port", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "http://:8080"}}, []string{"url must include a host"}},
 		{"http rejects query", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "https://a.example.test?token=x"}}, []string{"url must not include query"}},
@@ -2349,12 +2713,12 @@ func TestValidateRemoteHosts(t *testing.T) {
 		{"http rejects fragment", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "https://a.example.test/#remote"}}, []string{"url must not include fragment"}},
 		{"http rejects empty fragment delimiter", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "https://a.example.test#", Token: "token"}}, []string{"url must not include fragment"}},
 		{"http rejects userinfo", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "https://alice@a.example.test"}}, []string{"url must not include userinfo"}},
-		{"ssh rejects url", []RemoteHost{{Host: "a", Transport: RemoteTransportSSH, URL: "https://a.example.test"}}, []string{"url is only valid for http"}},
-		{"ssh rejects token", []RemoteHost{{Host: "a", Transport: RemoteTransportSSH, Token: "token"}}, []string{"token is only valid for http"}},
+		{"retired transport", []RemoteHost{{Host: "a", Transport: "ssh", URL: "https://a.example.test", Token: "token"}}, []string{"invalid transport \"ssh\"", "use http with a url and token"}},
 		{"unknown transport", []RemoteHost{{Host: "a", Transport: RemoteTransport("sftp")}}, []string{"invalid transport"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			err := Config{RemoteHosts: tt.hosts}.ValidateRemoteHosts()
 			if len(tt.wantErr) == 0 {
 				require.NoError(t, err)
@@ -2490,6 +2854,7 @@ func TestIsDefaultAgentsviewDBPath(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			assert.Equal(t, tc.want, IsDefaultAgentsviewDBPath(tc.dbPath))
 		})
 	}
@@ -2546,7 +2911,7 @@ func TestValidateArtifactOriginID(t *testing.T) {
 		origin  string
 		wantErr bool
 	}{
-		{"valid", "wesm-studio-m4", false},
+		{"valid", "host-a", false},
 		{"valid single word", "origin1", false},
 		{"empty", "", true},
 		{"reserved local", "local", true},
@@ -2649,8 +3014,7 @@ func TestDisabledAgentsNormalizeWithoutHidingConfiguredDirs(t *testing.T) {
 disabled_agents = [" gemini ", "claude", "gemini"]
 `))
 
-	assert.Equal(t,
-		[]parser.AgentType{parser.AgentClaude, parser.AgentGemini},
+	assert.Equal(t, []parser.AgentType{parser.AgentClaude, parser.AgentGemini},
 		cfg.DisabledAgents,
 	)
 	assert.Equal(t, geminiDirs, cfg.ResolveDirs(parser.AgentGemini))
@@ -2696,4 +3060,90 @@ func TestDisabledAgentsExplicitEmptyArrayEnablesDefaults(t *testing.T) {
 
 	assert.Empty(t, cfg.DisabledAgents)
 	assert.NotEmpty(t, cfg.ResolveDirs(parser.AgentGemini))
+}
+
+func TestResolveDirs_EvenerPrecedence(t *testing.T) {
+	for _, tc := range []struct {
+		name, state, override string
+		configured            bool
+	}{
+		{name: "home default"},
+		{name: "XDG state default", state: "state"},
+		{name: "explicit root", state: "state", override: "override", configured: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := setupTestEnv(t)
+			// Windows temporary paths may use a short-name alias. Resolve the
+			// existing root before appending the not-yet-created session paths.
+			root, err := filepath.EvalSymlinks(t.TempDir())
+			require.NoError(t, err)
+			t.Setenv("XDG_STATE_HOME", "")
+			t.Setenv("EVENER_DIR", "")
+			home, err := os.UserHomeDir()
+			require.NoError(t, err)
+			want := filepath.Join(home, ".local", "state", "evener")
+			if tc.state != "" {
+				state := filepath.Join(root, tc.state)
+				t.Setenv("XDG_STATE_HOME", state)
+				want = filepath.Join(state, "evener")
+			}
+			if tc.override != "" {
+				want = filepath.Join(root, tc.override)
+				t.Setenv("EVENER_DIR", want)
+			}
+			writeConfig(t, dir, map[string]any{})
+			cfg, err := LoadMinimal()
+			require.NoError(t, err)
+			assert.Equal(t, []string{want}, cfg.ResolveDirs(parser.AgentType("evener")))
+			assert.Equal(t, tc.configured, cfg.IsUserConfigured(parser.AgentType("evener")))
+		})
+	}
+	t.Run("config root", func(t *testing.T) {
+		dir := setupTestEnv(t)
+		root, err := filepath.EvalSymlinks(t.TempDir())
+		require.NoError(t, err)
+		t.Setenv("EVENER_DIR", "")
+		t.Setenv("XDG_STATE_HOME", t.TempDir())
+		want := filepath.Join(root, "sessions")
+		writeConfig(t, dir, map[string]any{"evener_dirs": []string{want}})
+		cfg, err := LoadMinimal()
+		require.NoError(t, err)
+		assert.Equal(t, []string{want}, cfg.ResolveDirs(parser.AgentType("evener")))
+		assert.True(t, cfg.IsUserConfigured(parser.AgentType("evener")))
+	})
+}
+
+func TestResolveDirs_CodebuffRootEnvVar(t *testing.T) {
+	t.Run("FREEBUFF_CONFIG_DIR re-roots the projects default", func(t *testing.T) {
+		dir := setupTestEnv(t)
+		setTestHome(t, canonicalTempDir(t))
+		root := filepath.Join(dir, "freebuff-root")
+		t.Setenv("CLAUDE_CONFIG_DIR", "")
+		t.Setenv("CODEX_HOME", "")
+		t.Setenv("CODEBUFF_DIR", "")
+		t.Setenv("FREEBUFF_CONFIG_DIR", root)
+		writeConfig(t, dir, map[string]any{})
+
+		cfg, err := LoadMinimal()
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{filepath.Join(root, "projects")},
+			cfg.ResolveDirs(parser.AgentCodebuff))
+	})
+
+	t.Run("CODEBUFF_DIR wins over FREEBUFF_CONFIG_DIR", func(t *testing.T) {
+		dir := setupTestEnv(t)
+		setTestHome(t, canonicalTempDir(t))
+		t.Setenv("CLAUDE_CONFIG_DIR", "")
+		t.Setenv("CODEX_HOME", "")
+		t.Setenv("CODEBUFF_DIR", filepath.Join(dir, "override"))
+		t.Setenv("FREEBUFF_CONFIG_DIR", filepath.Join(dir, "freebuff-root"))
+		writeConfig(t, dir, map[string]any{})
+
+		cfg, err := LoadMinimal()
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{filepath.Join(dir, "override")},
+			cfg.ResolveDirs(parser.AgentCodebuff))
+	})
 }

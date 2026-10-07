@@ -38,6 +38,7 @@
 </script>
 
 <script lang="ts">
+  import { FlashBanner, showFlash } from "@kenn-io/kit-ui";
   import { onMount, untrack } from "svelte";
   import AppHeader from "./lib/components/layout/AppHeader.svelte";
   import ThreeColumnLayout from "./lib/components/layout/ThreeColumnLayout.svelte";
@@ -50,6 +51,7 @@
   import { sessionTiming } from "./lib/stores/sessionTiming.svelte.js";
   import CommandPalette from "./lib/components/command-palette/CommandPalette.svelte";
   import AboutModal from "./lib/components/modals/AboutModal.svelte";
+  import GoToSessionModal from "./lib/components/modals/GoToSessionModal.svelte";
   import ShortcutsModal from "./lib/components/modals/ShortcutsModal.svelte";
   import PublishModal from "./lib/components/modals/PublishModal.svelte";
   import ResyncModal from "./lib/components/modals/ResyncModal.svelte";
@@ -84,8 +86,10 @@
     type PanelDateState,
   } from "./lib/stores/yokedDates.svelte.js";
   import { m } from "./lib/i18n/index.js";
-  import { setAuthToken, getAuthToken, setServerUrl, getBase } from "./lib/api/runtime.js";
+  import { setAuthToken, getAuthToken, setServerUrl } from "./lib/api/runtime.js";
   import { setupVisibilityHealthCheck } from "./lib/utils/health.js";
+  import { setupAppOpenedReporting } from "./lib/utils/app-opened.js";
+  import { reportTelemetry } from "./lib/utils/telemetry.js";
   import { registerShortcuts } from "./lib/utils/keyboard.js";
   import { shouldAutoSwitchTranscriptModeToNormal } from "./lib/utils/transcript-mode.js";
   import {
@@ -525,6 +529,7 @@
       }
       sessions.loadProjects();
       sessions.loadAgents();
+      sessions.loadMachines();
     });
   });
 
@@ -578,6 +583,51 @@
       } else if (sid === sessions.activeSessionId && !hydrated) {
         void sessions.navigateToSession(sid);
       }
+    });
+  });
+
+  // Telemetry: one session_viewed per transcript visit, sent once the
+  // session's metadata hydrates. The store keeps the active id while
+  // another page shows, so leaving the transcript resets the visit.
+  let viewedSessionId: string | null = null;
+  let selectedSessionId: string | null = null;
+  $effect(() => {
+    const route = router.route;
+    const activeId = sessions.activeSessionId;
+    const session = sessions.activeSession;
+    const routedId = router.sessionId;
+    untrack(() => {
+      if (activeId !== selectedSessionId) {
+        selectedSessionId = activeId;
+        viewedSessionId = null;
+      }
+      if (route !== "sessions" || activeId === null) {
+        viewedSessionId = null;
+        return;
+      }
+      // Wait for the URL to name the session, so a stale selection left from another page is not counted.
+      if (session && session.id === activeId && routedId === activeId && activeId !== viewedSessionId) {
+        viewedSessionId = activeId;
+        reportTelemetry("session_viewed", { agent: session.agent });
+      }
+    });
+  });
+
+  // Telemetry: one analytics_viewed per analytics page visit; token-usage is the usage page.
+  let lastAnalyticsPage: string | null = null;
+  $effect(() => {
+    const route = router.route;
+    let page: string | null = null;
+    if (route === "usage" || route === "token-usage") {
+      page = "usage";
+    } else if (route === "activity" || route === "trends" || route === "quality") {
+      page = route;
+    }
+    untrack(() => {
+      if (page !== null && page !== lastAnalyticsPage) {
+        reportTelemetry("analytics_viewed", { page });
+      }
+      lastAnalyticsPage = page;
     });
   });
 
@@ -727,6 +777,13 @@
     ui.activeModal = "about";
   }
 
+  $effect(() => {
+    const saveError = settings.saveError;
+    if (saveError) {
+      untrack(() => showFlash(saveError, { tone: "danger" }));
+    }
+  });
+
   onMount(() => {
     globalAuthToken = getAuthToken();
     settings.load();
@@ -736,8 +793,9 @@
     sync.loadVersion();
     sync.checkForUpdate();
     sync.startPolling();
+    const appOpenedCleanup = setupAppOpenedReporting();
 
-    const healthCleanup = setupVisibilityHealthCheck(getBase, {
+    const healthCleanup = setupVisibilityHealthCheck({
       onBackendDegraded: () => sync.markBackendDegraded(),
     });
 
@@ -747,6 +805,7 @@
       navigateUserPrompt,
     });
     return () => {
+      appOpenedCleanup();
       healthCleanup();
       cleanup();
       window.removeEventListener("show-about", showAbout);
@@ -797,6 +856,8 @@
 
 <AppHeader />
 
+<FlashBanner toneLabels={{ danger: m.settings_save_error_label() }} />
+
 {#if router.route === "usage" || router.route === "token-usage"}
   <div class="page-scroll">
     <UsagePage />
@@ -830,7 +891,7 @@
     <RecentEditsPage />
   </div>
 {:else if router.route === "data"}
-  <div class="page-scroll">
+  <div class="page-scroll data-page-host">
     <DataPage />
   </div>
 {:else if router.route === "settings"}
@@ -884,6 +945,10 @@
 
 {#if ui.activeModal === "commandPalette"}
   <CommandPalette />
+{/if}
+
+{#if ui.activeModal === "goToSession"}
+  <GoToSessionModal />
 {/if}
 
 {#if ui.activeModal === "shortcuts"}
@@ -942,6 +1007,11 @@
   }
 
   .settings-page-host {
+    display: flex;
+    overflow: hidden;
+  }
+
+  .data-page-host {
     display: flex;
     overflow: hidden;
   }
@@ -1059,7 +1129,7 @@
   }
 
   .auth-card-btn:disabled {
-    opacity: 0.6;
+    opacity: var(--opacity-disabled);
     cursor: default;
   }
 

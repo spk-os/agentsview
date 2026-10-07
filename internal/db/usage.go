@@ -16,6 +16,7 @@ import (
 	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/parser"
 	pricingpkg "go.kenn.io/agentsview/internal/pricing"
+	"go.kenn.io/agentsview/internal/timeutil"
 	"go.kenn.io/agentsview/internal/usagefacts"
 )
 
@@ -104,6 +105,9 @@ type UsageFilter struct {
 	// TopSessionsTokenTypes selects the counters used for token ranking.
 	// The zero value means all token types.
 	TopSessionsTokenTypes UsageTokenTypes
+
+	// Progress reports the work this query is waiting for, without session data.
+	Progress func(string) `json:"-"`
 }
 
 // ProjectFilterLabels returns exact include labels when present, otherwise it
@@ -342,18 +346,35 @@ func buildUsageTerminationPredSQLite(status string) (string, []any) {
 // location loads the timezone or returns the system local timezone.
 var usageLocationCache sync.Map
 
-func (f UsageFilter) location() *time.Location {
-	if f.Timezone == "" {
-		return time.Local
+// Location is the zone usage reports bucket calendar days in. Every backend
+// uses it so default requests agree on day boundaries.
+func (f UsageFilter) Location() *time.Location {
+	location := LoadLocationOr(f.Timezone, time.Local) //nolint:forbidigo // Usage reports group UTC timestamps into local calendar dates when no timezone is selected.
+	// Naming the local zone lets default and explicitly named requests share
+	// one rollup set and bucket days by the same rules.
+	if location == time.Local { //nolint:forbidigo // Only the process-local zone is renamed.
+		return usageLocalLocation()
 	}
-	if cached, ok := usageLocationCache.Load(f.Timezone); ok {
+	return location
+}
+
+// usageLocalLocation resolves the process-local zone once. Tests replace it.
+var usageLocalLocation = sync.OnceValue(timeutil.LocalLocation)
+
+// LoadLocationOr resolves a timezone name once per process and returns
+// fallback for an empty or unknown name.
+func LoadLocationOr(name string, fallback *time.Location) *time.Location {
+	if name == "" {
+		return fallback
+	}
+	if cached, ok := usageLocationCache.Load(name); ok {
 		return cached.(*time.Location)
 	}
-	loc, err := time.LoadLocation(f.Timezone)
+	loc, err := time.LoadLocation(name)
 	if err != nil {
-		return time.Local
+		return fallback
 	}
-	actual, _ := usageLocationCache.LoadOrStore(f.Timezone, loc)
+	actual, _ := usageLocationCache.LoadOrStore(name, loc)
 	return actual.(*time.Location)
 }
 
@@ -968,44 +989,38 @@ func usageBoundedRowsSQL(
 		"\n\tAND m.timestamp IS NOT NULL" +
 		"\n\tAND m.timestamp != ''"
 	var messageTimestampArgs []any
-	messageTimestampSourceWhere, messageTimestampArgs =
-		f.appendUsageSourceFilterClauses(
-			messageTimestampSourceWhere, messageTimestampArgs, "m.model")
+	messageTimestampSourceWhere, messageTimestampArgs = f.appendUsageSourceFilterClauses(
+		messageTimestampSourceWhere, messageTimestampArgs, "m.model")
 	messageTimestampSourceWhere, messageTimestampArgs = appendUsageColumnBounds(
 		messageTimestampSourceWhere, "m.timestamp", b, messageTimestampArgs)
 	var messageTimestampJoinArgs []any
-	messageTimestampJoinWhere, messageTimestampJoinArgs :=
-		f.appendUsageSessionFilterClauses(
-			usageSessionEligibility, messageTimestampJoinArgs)
+	messageTimestampJoinWhere, messageTimestampJoinArgs := f.appendUsageSessionFilterClauses(
+		usageSessionEligibility, messageTimestampJoinArgs)
 
 	eventTimestampSourceWhere := usageEventSourceEligibility +
 		"\n\tAND ue.occurred_at IS NOT NULL"
 	var eventTimestampArgs []any
-	eventTimestampSourceWhere, eventTimestampArgs =
-		f.appendUsageSourceFilterClauses(
-			eventTimestampSourceWhere, eventTimestampArgs, "ue.model")
+	eventTimestampSourceWhere, eventTimestampArgs = f.appendUsageSourceFilterClauses(
+		eventTimestampSourceWhere, eventTimestampArgs, "ue.model")
 	eventTimestampSourceWhere, eventTimestampArgs = appendUsageColumnBounds(
 		eventTimestampSourceWhere, "ue.occurred_at", b, eventTimestampArgs)
 	var eventTimestampJoinArgs []any
-	eventTimestampJoinWhere, eventTimestampJoinArgs :=
-		f.appendUsageSessionFilterClauses(
-			usageSessionEligibility, eventTimestampJoinArgs)
+	eventTimestampJoinWhere, eventTimestampJoinArgs := f.appendUsageSessionFilterClauses(
+		usageSessionEligibility, eventTimestampJoinArgs)
 
 	messageFallbackWhere := messageEligibility +
 		"\n\tAND NULLIF(m.timestamp, '') IS NULL"
 	var messageFallbackArgs []any
-	messageFallbackWhere, messageFallbackArgs =
-		f.appendUsageBranchFilterClauses(
-			messageFallbackWhere, messageFallbackArgs, "m.model")
+	messageFallbackWhere, messageFallbackArgs = f.appendUsageBranchFilterClauses(
+		messageFallbackWhere, messageFallbackArgs, "m.model")
 	messageFallbackWhere, messageFallbackArgs = appendUsageColumnBounds(
 		messageFallbackWhere, "s.started_at", b, messageFallbackArgs)
 
 	eventFallbackWhere := usageEventEligibility +
 		"\n\tAND ue.occurred_at IS NULL"
 	var eventFallbackArgs []any
-	eventFallbackWhere, eventFallbackArgs =
-		f.appendUsageBranchFilterClauses(
-			eventFallbackWhere, eventFallbackArgs, "ue.model")
+	eventFallbackWhere, eventFallbackArgs = f.appendUsageBranchFilterClauses(
+		eventFallbackWhere, eventFallbackArgs, "ue.model")
 	eventFallbackWhere, eventFallbackArgs = appendUsageColumnBounds(
 		eventFallbackWhere, "s.started_at", b, eventFallbackArgs)
 
@@ -1158,7 +1173,7 @@ func dailyUsageRowsSQLForBounds(
 }
 
 func exactUsageUTCWindow(f UsageFilter) usageBounds {
-	loc := f.location()
+	loc := f.Location()
 	var out usageBounds
 	if f.From != "" {
 		if from, err := time.ParseInLocation("2006-01-02", f.From, loc); err == nil {
@@ -1565,8 +1580,7 @@ func floorNegativeTokens(v int) int {
 func clampedUsageTokenCounters(
 	tokenJSON string,
 ) (inputTok, outputTok, cacheCrTok, cacheRdTok int) {
-	inputTok, outputTok, cacheCrTok, cacheRdTok, _ =
-		parseUsageTokenCountersWithReasoning(tokenJSON)
+	inputTok, outputTok, cacheCrTok, cacheRdTok, _ = parseUsageTokenCountersWithReasoning(tokenJSON)
 	return ClampPlausibleTokens(int64(inputTok)),
 		ClampPlausibleTokens(int64(outputTok)),
 		ClampPlausibleTokens(int64(cacheCrTok)),
@@ -1576,8 +1590,7 @@ func clampedUsageTokenCounters(
 func clampedUsageTokenCountersWithReasoning(
 	tokenJSON string,
 ) (inputTok, outputTok, cacheCrTok, cacheRdTok, reasoningTok int) {
-	inputTok, outputTok, cacheCrTok, cacheRdTok, reasoningTok =
-		parseUsageTokenCountersWithReasoning(tokenJSON)
+	inputTok, outputTok, cacheCrTok, cacheRdTok, reasoningTok = parseUsageTokenCountersWithReasoning(tokenJSON)
 	return ClampPlausibleTokens(int64(inputTok)),
 		ClampPlausibleTokens(int64(outputTok)),
 		ClampPlausibleTokens(int64(cacheCrTok)),
@@ -1622,21 +1635,13 @@ func dailyUsageAmounts(
 	if err != nil {
 		return 0, 0, 0, 0, money.Money{}, money.Money{}, err
 	}
-	_, lookup := pricing.ResolveAt(
-		r.model, usageLookupModel(r.model, r.pricingTS),
-		usagePricingTimestamp(r.pricingTS),
-	)
+	// Record the exact lookup behind the charge, including provider billing
+	// adjustments, rather than resolving the row again for provenance.
 	if priced.Reported > 0 {
-		pricing.RecordResolvedReported(r.model, priced.PricedModel, lookup)
+		pricing.RecordResolvedReported(r.model, priced.PricedModel, priced.lookup)
 	} else {
-		_, lookup, err = pricing.ResolveBilledAt(
-			r.providerID, r.model, usageLookupModel(r.model, r.pricingTS),
-			usagePricingTimestamp(r.pricingTS))
-		if err != nil {
-			return 0, 0, 0, 0, money.Money{}, money.Money{}, err
-		}
 		recordComputedUsagePricing(
-			pricing, r.model, priced.PricedModel, lookup, fact.RequestScoped,
+			pricing, r.model, priced.PricedModel, priced.lookup, fact.RequestScoped,
 			inputTok, cacheCrTok, cacheRdTok,
 		)
 	}
@@ -1915,10 +1920,8 @@ func SanitizeDailyUsageProjectLabelsWithCatalog(
 	for i := range result.Daily {
 		for j := range result.Daily[i].ProjectBreakdowns {
 			raw := result.Daily[i].ProjectBreakdowns[j].Project
-			result.Daily[i].ProjectBreakdowns[j].ProjectKey =
-				export.ProjectKeyForEntry(projects[raw])
-			result.Daily[i].ProjectBreakdowns[j].Project =
-				export.SafeProjectDisplayLabel(raw)
+			result.Daily[i].ProjectBreakdowns[j].ProjectKey = export.ProjectKeyForEntry(projects[raw])
+			result.Daily[i].ProjectBreakdowns[j].Project = export.SafeProjectDisplayLabel(raw)
 		}
 	}
 	if result.SessionCounts.ByProject != nil {
@@ -2179,7 +2182,7 @@ func paddedUTCBound(ts string, hours int) string {
 func (db *DB) getDailyUsageLegacy(
 	ctx context.Context, f UsageFilter,
 ) (DailyUsageResult, error) {
-	loc := f.location()
+	loc := f.Location()
 
 	pricing, err := db.loadPricingMap(ctx)
 	if err != nil {
@@ -2194,7 +2197,7 @@ func (db *DB) getDailyUsageLegacy(
 	// date filtering happens post-query via localDate.
 	bounds := usageBoundsForFilter(f)
 	query, rowsArgs := dailyUsageRowsSQLForBounds(
-		f, bounds, db.hasCursorUsageTable())
+		f, bounds, db.hasCursorUsageTable(ctx))
 	query, args := snapshotRankedDailyUsageRowsSQL(query, rowsArgs, f, bounds)
 	query = dailyUsageRowSelectFromSnapshotRowsWithMachine(
 		query, f.Breakdowns)
@@ -2277,8 +2280,7 @@ func (db *DB) getDailyUsageLegacy(
 			projectLabels[r.project] = struct{}{}
 		}
 
-		inputTok, outputTok, cacheCrTok, cacheRdTok, cost, savings, priceErr :=
-			dailyUsageAmounts(r, rateResolver)
+		inputTok, outputTok, cacheCrTok, cacheRdTok, cost, savings, priceErr := dailyUsageAmounts(r, rateResolver)
 		if priceErr != nil {
 			return DailyUsageResult{}, priceErr
 		}
@@ -2863,7 +2865,7 @@ func (db *DB) getTopSessionsByCostLegacy(
 	}
 	defer rows.Close()
 
-	loc := f.location()
+	loc := f.Location()
 
 	type sessAccum struct {
 		inputTokens       int
@@ -2912,8 +2914,7 @@ func (db *DB) getTopSessionsByCostLegacy(
 			seen[key] = struct{}{}
 		}
 
-		inputTok, outputTok, cacheCrTok, cacheRdTok, cost, _, priceErr :=
-			dailyUsageAmounts(r, rateResolver)
+		inputTok, outputTok, cacheCrTok, cacheRdTok, cost, _, priceErr := dailyUsageAmounts(r, rateResolver)
 		if priceErr != nil {
 			return nil, priceErr
 		}
@@ -3093,8 +3094,7 @@ func sessionRowCostWithWebSearchRequests(
 	var inTok, outTok, crTok, cr1hTok, rdTok int
 	reasoningTok := r.reasoningTokens
 	if r.usageSource == "message" {
-		inTok, outTok, crTok, rdTok, reasoningTok =
-			clampedUsageTokenCountersWithReasoning(r.tokenJSON)
+		inTok, outTok, crTok, rdTok, reasoningTok = clampedUsageTokenCountersWithReasoning(r.tokenJSON)
 		cr1hTok = clampedCacheCreation1hTokens(r.tokenJSON)
 	} else {
 		inTok, outTok, crTok, rdTok = usageEventRowTokens(
@@ -3164,8 +3164,7 @@ func sessionUsageBreakdownEntryWithWebSearchRequests(
 ) SessionUsageBreakdownEntry {
 	var inTok, outTok, crTok, rdTok int
 	if r.usageSource == "message" {
-		inTok, outTok, crTok, rdTok =
-			clampedUsageTokenCounters(r.tokenJSON)
+		inTok, outTok, crTok, rdTok = clampedUsageTokenCounters(r.tokenJSON)
 	} else {
 		inTok, outTok, crTok, rdTok = usageEventRowTokens(
 			r.usageSource,
@@ -3288,8 +3287,7 @@ func (db *DB) getSessionUsageLegacy(
 			ClaudeRequestID: r.claudeRequestID,
 		}
 	}
-	snapshotMask, _, snapshotWebSearchRequests, err :=
-		activity.ClaudeSnapshotSurvivorSelectionContext(ctx, snapshotRows)
+	snapshotMask, _, snapshotWebSearchRequests, err := activity.ClaudeSnapshotSurvivorSelectionContext(ctx, snapshotRows)
 	if err != nil {
 		return nil, err
 	}
@@ -3496,7 +3494,7 @@ func (db *DB) getUsageSessionCountsLegacy(
 	}
 	defer rows.Close()
 
-	loc := f.location()
+	loc := f.Location()
 
 	// Track which sessions pass the localDate filter via a
 	// set of seen session IDs. Each session is counted once
@@ -3602,7 +3600,7 @@ func (db *DB) getUsageMatchingSessionCountLegacy(
 	}
 	defer rows.Close()
 
-	loc := f.location()
+	loc := f.Location()
 	seen := make(map[string]struct{})
 	for rows.Next() {
 		r, err := scanDailyUsageRow(rows)

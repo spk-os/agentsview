@@ -829,6 +829,7 @@ func (s *Store) GetAnalyticsSummary(
 	if err != nil {
 		return db.AnalyticsSummary{}, fmt.Errorf("querying duckdb analytics summary: %w", err)
 	}
+	defer rows.Close()
 	resp := db.AnalyticsSummary{Agents: map[string]*db.AgentSummary{}}
 	if !rows.Next() {
 		rows.Close()
@@ -1090,7 +1091,8 @@ func (s *Store) queryActivityBuckets(
 		message_rows AS (
 			SELECT `+bucketExpr+` AS bucket,
 				COUNT(*) AS messages,
-				COUNT(*) FILTER (WHERE m.role = 'user' AND m.is_system = FALSE) AS user_messages,
+				COUNT(*) FILTER (WHERE m.role = 'user' AND m.is_system = FALSE
+					AND COALESCE(m.source_subtype, '') != 'tool_result') AS user_messages,
 				COUNT(*) FILTER (WHERE m.role = 'assistant') AS assistant_messages,
 				COUNT(*) FILTER (WHERE m.has_thinking = TRUE) AS thinking_messages
 			FROM filtered_sessions fs
@@ -1743,7 +1745,8 @@ func (s *Store) analyticsAutonomyBuckets(
 	}
 	rows, err := s.queryContext(ctx, `
 		SELECT session_id,
-			SUM(CASE WHEN role = 'user' AND is_system = FALSE THEN 1 ELSE 0 END) AS user_count,
+			SUM(CASE WHEN role = 'user' AND is_system = FALSE
+				AND COALESCE(source_subtype, '') != 'tool_result' THEN 1 ELSE 0 END) AS user_count,
 			SUM(CASE WHEN role = 'assistant' AND has_tool_use = TRUE THEN 1 ELSE 0 END) AS tool_count
 		FROM messages
 		WHERE session_id IN (`+strings.Join(placeholders, ",")+`)
@@ -2623,7 +2626,7 @@ func (s *Store) duckPopulateFrustrationMarkers(
 	}
 	q := `SELECT session_id, content, is_system
 		FROM messages
-		WHERE role = 'user' AND session_id IN (` +
+		WHERE role = 'user' AND COALESCE(source_subtype, '') <> 'tool_result' AND session_id IN (` +
 		strings.Join(placeholders, ",") + `)`
 	msgRows, err := s.queryContext(ctx, q, args...)
 	if err != nil {
@@ -2674,13 +2677,14 @@ func (s *Store) duckSignalMessages(
 			for sessionID, scopedRows := range scope.MessagesBySession() {
 				for _, row := range scopedRows {
 					out[sessionID] = append(out[sessionID], db.SignalMessage{
-						SessionID:  row.SessionID,
-						Ordinal:    row.Ordinal,
-						Role:       row.Role,
-						Content:    row.Content,
-						Timestamp:  row.Timestamp,
-						IsSystem:   row.IsSystem,
-						HasToolUse: row.HasToolUse,
+						SessionID:     row.SessionID,
+						Ordinal:       row.Ordinal,
+						Role:          row.Role,
+						SourceSubtype: row.SourceSubtype,
+						Content:       row.Content,
+						Timestamp:     row.Timestamp,
+						IsSystem:      row.IsSystem,
+						HasToolUse:    row.HasToolUse,
 					})
 				}
 			}
@@ -2688,14 +2692,14 @@ func (s *Store) duckSignalMessages(
 		return out, nil
 	}
 	placeholders := make([]string, len(rows))
-	args := make([]any, len(rows))
+	args := make([]any, 0, len(rows))
 	for i, r := range rows {
 		placeholders[i] = "?"
-		args[i] = r.ID
+		args = append(args, r.ID)
 	}
 	filterModels := duckAnalyticsCSVValues(f.Model)
 	q := `SELECT session_id, ordinal, role, content,
-			timestamp, is_system, has_tool_use
+			timestamp, is_system, has_tool_use, COALESCE(source_subtype, '')
 		FROM messages
 		WHERE session_id IN (` + strings.Join(placeholders, ",") + `)`
 	if len(filterModels) == 1 {
@@ -2722,7 +2726,7 @@ func (s *Store) duckSignalMessages(
 		if err := msgRows.Scan(
 			&m.SessionID, &m.Ordinal, &m.Role,
 			&m.Content, &ts,
-			&m.IsSystem, &m.HasToolUse,
+			&m.IsSystem, &m.HasToolUse, &m.SourceSubtype,
 		); err != nil {
 			return nil, fmt.Errorf("scanning duckdb signal message: %w", err)
 		}
@@ -3541,8 +3545,13 @@ func duckDailyUsageRawSQL(f db.UsageFilter) (string, []any) {
 }
 
 func duckUsageLocalDateSQL(f db.UsageFilter) (string, any) {
-	if f.Timezone != "" {
-		return "COALESCE(strftime(timezone(?, timezone('UTC', ts)), '%Y-%m-%d'), '')", f.Timezone
+	name := f.Timezone
+	// The shared default zone converts per timestamp, so dates follow DST.
+	if location := f.Location(); name == "" && location.String() != "Local" {
+		name = location.String()
+	}
+	if name != "" {
+		return "COALESCE(strftime(timezone(?, timezone('UTC', ts)), '%Y-%m-%d'), '')", name
 	}
 	ref := time.Now().UTC()
 	if f.From != "" {
@@ -3550,7 +3559,7 @@ func duckUsageLocalDateSQL(f db.UsageFilter) (string, any) {
 			ref = t
 		}
 	}
-	_, offset := ref.In(time.Local).Zone()
+	_, offset := ref.In(f.Location()).Zone()
 	return "COALESCE(strftime(ts + (? * INTERVAL 1 SECOND), '%Y-%m-%d'), '')", offset
 }
 
@@ -3582,9 +3591,13 @@ func duckPriceModelCaseSQL() string {
 	var b strings.Builder
 	b.WriteString("CASE\n")
 	for _, alias := range pricingpkg.FixedPricingAliases() {
+		modelExpr := "regexp_replace(model, '^.*/', '')"
+		if alias.Exact {
+			modelExpr = "model"
+		}
 		fmt.Fprintf(&b,
-			"\t\tWHEN regexp_replace(model, '^.*/', '') = %s THEN %s\n",
-			duckSQLString(alias.Name), duckSQLString(alias.Canonical),
+			"\t\tWHEN %s = %s THEN %s\n",
+			modelExpr, duckSQLString(alias.Name), duckSQLString(alias.Canonical),
 		)
 	}
 	aliases := pricingpkg.DateAliasedModels()

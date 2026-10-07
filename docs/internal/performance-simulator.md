@@ -111,6 +111,22 @@ deliberately contains repeated search terms, stressing common-term FTS.
 
 ## OpenCode SQLite workload
 
+Use `--source-format opencode-v2` for the event-sourced message projections. For
+example:
+
+```bash
+make perf-sim PERF_SIM_FLAGS='--source-format opencode-v2 --sessions 100 --turns 5 --active 2 --iterations 3'
+```
+
+This mode creates the beta `session_v2` and `session_message` tables with their
+published indexes, without the v1 `session`, `message`, or `part` tables. It
+simulates prompt and assistant-step insertion, then finalizes assistant text and
+usage by updating the same row without changing its event sequence. Child-only
+edits update the projected assistant content. The same archive-content and usage
+checks described below apply to both OpenCode modes. See
+`session-format-sources.md` for upstream evidence and the captured real v2
+workflow used by parser tests.
+
 `--source-format opencode` creates a separate producer database in WAL mode and
 keeps its writer open while Agentsview reads it. Only this synthetic database
 receives producer writes; the archive is populated through the normal provider.
@@ -150,9 +166,9 @@ too. Session/message count and literal usage/content assertions cover both
 layouts in the normal Go suite.
 
 This is the OpenCode `message`/`part` layout consumed by Agentsview, not an
-OpenCode process or an exhaustive producer emulator. It omits the newer
-`session_message` projection, tools, concurrent writers, and deletions. Schema
-and write provenance are recorded in
+OpenCode process or an exhaustive producer emulator. The default `opencode` mode
+omits v2 projections; `opencode-v2` exercises them. Both modes omit tools,
+concurrent writers, and deletions. Schema and write provenance are recorded in
 [session format sources](session-format-sources.md).
 
 ## Generating sources for a real server
@@ -173,10 +189,10 @@ new content through `/api/v1/sessions/{id}/messages?direction=desc&limit=10`.
 Record commit-to-visible latency separately from engine batch duration.
 
 A real server launches sync-worker subprocesses. Capture parent and worker CPU
-and memory separately; parent `/debug/pprof` profiles omit worker execution.
-Record forced-GC heaps and macOS `vmmap -summary` alongside RSS. Keep raw
-captures in a durable output directory, not only an operating-system temporary
-directory.
+and memory separately; parent `/debug/pprof` profiles omit worker execution. See
+[Profiling sync workers](#profiling-sync-workers) for worker capture. Record
+forced-GC heaps and macOS `vmmap -summary` alongside RSS. Keep raw captures in a
+durable output directory, not only an operating-system temporary directory.
 
 `make perf-sim` enables VCS build metadata. Direct builds should use
 `go build -buildvcs=true` or `go run -buildvcs=true`. Missing revision metadata
@@ -184,6 +200,44 @@ means unknown, not a clean build. Build overlays are not described by VCS
 metadata; use `--provenance-note` to record the overlay and retain its patch
 with the results. Executable hashes identify binaries but cannot reconstruct
 them.
+
+## Profiling sync workers
+
+A daemon runs heavy sync passes (startup sync, foreground sync, resync builds,
+and daily audits) in a separate `sync-worker` process. The hidden
+`--cpuprofile`, `--memprofile`, and `--trace` flags on `agentsview sync` profile
+only the CLI process, which mostly waits for the daemon. To profile the worker,
+set these variables in the environment that starts an isolated daemon or worker:
+
+- `AGENTSVIEW_SYNC_PROFILE_DIR`: output root. Each worker creates its own
+  owner-only directory under it named `sync-worker-<mode>-<pid>-<suffix>`,
+  where mode is `startup`, `sync`, `resync-build`, or `audit`. The directory
+  holds `cpu.pprof` and `memory.pprof`.
+- `AGENTSVIEW_SYNC_PROFILE_TRACE=true`: also write `runtime.trace` in the same
+  directory. Tracing is separate because a full archive rebuild can produce a
+  large trace.
+
+Workers inherit the daemon's environment. A running daemon does not pick up new
+settings, so start a new isolated daemon with the variables set. Profiling is
+off by default. An invalid trace value or an output root that cannot be created
+logs a diagnostic to the data directory's `debug.log` and runs the pass without
+worker profiling. Worker stdout stays reserved for the progress and result
+protocol.
+
+Read the artifacts with these limits in mind:
+
+- CPU and trace capture stop before the final forced garbage collection and heap
+  encoding, so that shutdown work does not appear as sync work.
+- `memory.pprof` is written after that forced collection. Its `inuse_*` samples
+  show what survived the pass, not peak memory. Use
+  `go tool pprof -sample_index=alloc_space` for allocation volume.
+- Measure process peak memory separately with operating-system tools, such as
+  cgroup `memory.peak` on Linux or the `vmmap` physical footprint on macOS.
+- Profiling adds overhead. Keep benchmark timing runs unprofiled and collect
+  profiles in separate diagnostic runs.
+
+Profile only disposable source and archive clones. Never point a profiled worker
+at the live archive or real agent transcripts.
 
 ## Sidecar events and deleted members
 

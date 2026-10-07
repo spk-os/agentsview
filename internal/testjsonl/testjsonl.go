@@ -181,6 +181,34 @@ func CodexSubagentSessionMetaJSON(
 	return mustMarshal(m)
 }
 
+// CodexSubagentSessionMetaVariantJSON returns a configurable subagent source.
+func CodexSubagentSessionMetaVariantJSON(
+	threadSource string,
+	subagentSource any,
+	id, parentID, cwd, originator, timestamp string,
+) string {
+	payload := map[string]any{
+		"id":               id,
+		"cwd":              cwd,
+		"originator":       originator,
+		"agent_nickname":   "worker",
+		"agent_path":       "/root/worker",
+		"parent_thread_id": parentID,
+		"session_id":       parentID,
+		"source": map[string]any{
+			"subagent": subagentSource,
+		},
+	}
+	if threadSource != "" {
+		payload["thread_source"] = threadSource
+	}
+	return mustMarshal(map[string]any{
+		"type":      "session_meta",
+		"timestamp": timestamp,
+		"payload":   payload,
+	})
+}
+
 // CodexAgentMessageJSON returns a current Codex inter-agent message. Codex
 // stores the delivered task in the encrypted_content field even when its
 // value is plaintext.
@@ -416,6 +444,31 @@ func CodexTokenCountJSON(
 					"output_tokens":       outputTokens,
 					"cached_input_tokens": cachedInputTokens,
 					"total_tokens":        inputTokens + outputTokens,
+				},
+			},
+		},
+	}
+	return mustMarshal(m)
+}
+
+// CodexTokenCountWithCacheWriteJSON returns a Codex token_count event whose
+// last_token_usage includes cache_write_input_tokens inside input_tokens.
+func CodexTokenCountWithCacheWriteJSON(
+	timestamp string,
+	inputTokens, outputTokens, cachedInputTokens, cacheWriteInputTokens int,
+) string {
+	m := map[string]any{
+		"type":      "event_msg",
+		"timestamp": timestamp,
+		"payload": map[string]any{
+			"type": "token_count",
+			"info": map[string]any{
+				"last_token_usage": map[string]any{
+					"input_tokens":             inputTokens,
+					"output_tokens":            outputTokens,
+					"cached_input_tokens":      cachedInputTokens,
+					"cache_write_input_tokens": cacheWriteInputTokens,
+					"total_tokens":             inputTokens + outputTokens,
 				},
 			},
 		},

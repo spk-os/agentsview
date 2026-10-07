@@ -46,17 +46,6 @@ const pgUsageEventSourceEligibility = `
 
 const pgUsageSessionEligibility = `s.deleted_at IS NULL`
 
-func usageLocation(f db.UsageFilter) *time.Location {
-	if f.Timezone == "" {
-		return time.Local
-	}
-	loc, err := time.LoadLocation(f.Timezone)
-	if err != nil {
-		return time.Local
-	}
-	return loc
-}
-
 func paddedUTCBound(ts string, hours int) string {
 	t, err := time.Parse(time.RFC3339, ts)
 	if err != nil {
@@ -911,7 +900,7 @@ func pgUsageSnapshotInputFilter(f db.UsageFilter) db.UsageFilter {
 }
 
 func pgExactUsageUTCWindow(f db.UsageFilter) (from, to time.Time) {
-	loc := usageLocation(f)
+	loc := f.Location()
 	if f.From != "" {
 		from, _ = time.ParseInLocation("2006-01-02", f.From, loc)
 	}
@@ -1166,8 +1155,7 @@ func pgDailyUsageAmounts(
 	cost, savings money.Money,
 	err error,
 ) {
-	inputTok, outputTok, cacheCrTok, cacheRdTok, reasoningTok :=
-		pgDailyUsageRowTokens(r)
+	inputTok, outputTok, cacheCrTok, cacheRdTok, reasoningTok := pgDailyUsageRowTokens(r)
 	cacheCr1hTok := pgUsageRowCacheCreation1hTokens(
 		r.usageSource, r.tokenJSON, cacheCrTok)
 
@@ -1271,11 +1259,10 @@ func pgDailyUsageRowTokens(
 		cacheRdTok = pgTokenJSONCount(usage, "cache_read_input_tokens")
 		reasoningTok = pgTokenJSONCount(usage, "reasoning_tokens")
 	} else {
-		inputTok, outputTok, cacheCrTok, cacheRdTok =
-			pgUsageEventRowTokens(
-				r.usageSource,
-				r.inputTokens, r.outputTokens,
-				r.cacheCreationInputTokens, r.cacheReadInputTokens)
+		inputTok, outputTok, cacheCrTok, cacheRdTok = pgUsageEventRowTokens(
+			r.usageSource,
+			r.inputTokens, r.outputTokens,
+			r.cacheCreationInputTokens, r.cacheReadInputTokens)
 	}
 	return
 }
@@ -1622,8 +1609,7 @@ func (s *Store) GetSessionUsage(
 			ClaudeRequestID: r.claudeRequestID,
 		}
 	}
-	snapshotMask, _, snapshotWebSearchRequests :=
-		activity.ClaudeSnapshotSurvivorSelection(snapshotRows)
+	snapshotMask, _, snapshotWebSearchRequests := activity.ClaudeSnapshotSurvivorSelection(snapshotRows)
 	deduplicatedOutputTokens := 0
 	seen := make(map[pgUsageDedupToken]struct{})
 	for i, r := range usageRows {
@@ -1648,9 +1634,8 @@ func (s *Store) GetSessionUsage(
 			authoritativeCost = &v
 			costRow.cost = sql.NullInt64{}
 		}
-		c, priced, contributes, priceErr :=
-			pgSessionRowCostWithWebSearchRequests(
-				costRow, snapshotWebSearchRequests[i], rateResolver)
+		c, priced, contributes, priceErr := pgSessionRowCostWithWebSearchRequests(
+			costRow, snapshotWebSearchRequests[i], rateResolver)
 		if priceErr != nil {
 			return nil, priceErr
 		}
@@ -1738,7 +1723,7 @@ func sortedStringSetKeys(set map[string]struct{}) []string {
 func (s *Store) GetDailyUsage(
 	ctx context.Context, f db.UsageFilter,
 ) (db.DailyUsageResult, error) {
-	loc := usageLocation(f)
+	loc := f.Location()
 
 	pricing, err := s.loadPricingMap(ctx)
 	if err != nil {
@@ -1825,8 +1810,7 @@ func (s *Store) GetDailyUsage(
 			projectLabels[r.project] = struct{}{}
 		}
 
-		inputTok, outputTok, cacheCrTok, cacheRdTok, cost, savings, priceErr :=
-			pgDailyUsageAmounts(r, rateResolver)
+		inputTok, outputTok, cacheCrTok, cacheRdTok, cost, savings, priceErr := pgDailyUsageAmounts(r, rateResolver)
 		if priceErr != nil {
 			return db.DailyUsageResult{}, priceErr
 		}
@@ -2349,7 +2333,7 @@ func (s *Store) GetTopSessionsByCost(
 	}
 	defer rows.Close()
 
-	loc := usageLocation(f)
+	loc := f.Location()
 	type sessAccum struct {
 		inputTokens       int
 		outputTokens      int
@@ -2388,8 +2372,7 @@ func (s *Store) GetTopSessionsByCost(
 			seen[key] = struct{}{}
 		}
 
-		inputTok, outputTok, cacheCrTok, cacheRdTok, cost, _, priceErr :=
-			pgDailyUsageAmounts(r, rateResolver)
+		inputTok, outputTok, cacheCrTok, cacheRdTok, cost, _, priceErr := pgDailyUsageAmounts(r, rateResolver)
 		if priceErr != nil {
 			return nil, priceErr
 		}
@@ -2481,7 +2464,7 @@ func (s *Store) GetUsageSessionCounts(
 	}
 	defer rows.Close()
 
-	loc := usageLocation(f)
+	loc := f.Location()
 	type sessInfo struct {
 		project string
 		agent   string
@@ -2604,7 +2587,7 @@ WHERE `+where, pb.args...).Scan(&count)
 	}
 	defer rows.Close()
 
-	loc := usageLocation(f)
+	loc := f.Location()
 	seen := make(map[string]struct{})
 	for rows.Next() {
 		r, err := scanPGDailyUsageRow(rows)
